@@ -1,0 +1,894 @@
+import { useEffect, useState } from "react";
+import { motion, AnimatePresence } from "framer-motion";
+import { ArrowLeft, RotateCcw, Save, Info, Loader } from "lucide-react";
+import { invoke } from "@tauri-apps/api/core";
+import { cn } from "../../../design-tokens";
+import { useI18n } from "../../../../core/i18n/context";
+import type { AdvancedModelSettings } from "../../../../core/storage/schemas";
+import { LlamaSamplerOrderEditor } from "../../../components/LlamaSamplerOrderEditor";
+import { Switch } from "../../../components/Switch";
+import { NumberInput } from "../../../components/NumberInput";
+import {
+  ADVANCED_TEMPERATURE_RANGE,
+  ADVANCED_TOP_P_RANGE,
+  ADVANCED_MAX_TOKENS_RANGE,
+  ADVANCED_FREQUENCY_PENALTY_RANGE,
+  ADVANCED_PRESENCE_PENALTY_RANGE,
+  ADVANCED_TOP_K_RANGE,
+  ADVANCED_LLAMA_DRY_ALLOWED_LENGTH_RANGE,
+  ADVANCED_LLAMA_DRY_BASE_RANGE,
+  ADVANCED_LLAMA_DRY_MULTIPLIER_RANGE,
+  ADVANCED_LLAMA_DRY_PENALTY_LAST_N_RANGE,
+  ADVANCED_LLAMA_REPEAT_PENALTY_RANGE,
+  ADVANCED_LLAMA_N_PEN_RANGE,
+  ADVANCED_LLAMA_XTC_PROBABILITY_RANGE,
+  ADVANCED_LLAMA_XTC_THRESHOLD_RANGE,
+} from "../../../components/AdvancedModelSettingsForm";
+
+interface ParameterFieldProps {
+  label: string;
+  description: string;
+  value: number | null | undefined;
+  placeholder: string;
+  min: number;
+  max: number;
+  step: number;
+  onChange: (value: number | null) => void;
+  inputMode?: "decimal" | "numeric";
+  rangeLabels?: [string, string];
+  disabled?: boolean;
+}
+
+function ParameterField({
+  label,
+  description,
+  value,
+  placeholder,
+  min,
+  max,
+  step,
+  onChange,
+  rangeLabels,
+  disabled = false,
+}: ParameterFieldProps) {
+  return (
+    <div className="space-y-2">
+      <div className="flex items-baseline justify-between gap-2">
+        <label className="text-[13px] font-medium text-fg/80">{label}</label>
+        <span className="font-mono text-[12px] text-accent/80">
+          {value != null ? (step < 1 ? value.toFixed(2) : String(value)) : placeholder}
+        </span>
+      </div>
+      <p className="text-[11px] text-fg/40 leading-relaxed">{description}</p>
+      <NumberInput
+        min={min}
+        max={max}
+        step={step}
+        decimals={step < 1 ? 2 : 0}
+        value={value ?? null}
+        onChange={onChange}
+        disabled={disabled}
+        placeholder={placeholder}
+        className={cn(
+          "w-full rounded-lg border border-fg/10 bg-fg/5 px-3 py-2 text-sm text-fg placeholder-fg/30 transition focus:border-fg/20 focus:outline-none",
+          disabled && "cursor-not-allowed opacity-60",
+        )}
+      />
+      {rangeLabels && (
+        <div className="flex justify-between text-[10px] text-fg/30">
+          <span>{rangeLabels[0]}</span>
+          <span>{rangeLabels[1]}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+interface SessionAdvancedSettingsProps {
+  isOpen: boolean;
+  onClose: () => void;
+  draft: AdvancedModelSettings;
+  onDraftChange: (draft: AdvancedModelSettings) => void;
+  overrideEnabled: boolean;
+  onOverrideEnabledChange: (enabled: boolean) => void;
+  baseSettings: AdvancedModelSettings;
+  onSave: (settings: AdvancedModelSettings | null) => void;
+  onShowParameterSupport: () => void;
+  hasSession: boolean;
+  providerId?: string;
+  modelPath?: string;
+}
+
+export function SessionAdvancedSettings({
+  isOpen,
+  onClose,
+  draft,
+  onDraftChange,
+  overrideEnabled,
+  onOverrideEnabledChange,
+  baseSettings,
+  onSave,
+  onShowParameterSupport,
+  hasSession,
+  providerId = "openai",
+  modelPath,
+}: SessionAdvancedSettingsProps) {
+  const { t } = useI18n();
+  const isLlama = providerId === "llamacpp";
+
+  // Context info for llama models
+  const [contextInfo, setContextInfo] = useState<{
+    maxContextLength: number;
+    recommendedContextLength?: number | null;
+    availableMemoryBytes?: number | null;
+    availableVramBytes?: number | null;
+    modelSizeBytes?: number | null;
+    supportsGpuOffload?: boolean | null;
+  } | null>(null);
+  const [contextLoading, setContextLoading] = useState(false);
+  const isCpuOnlyLlamaBackend = isLlama && contextInfo?.supportsGpuOffload === false;
+
+  useEffect(() => {
+    if (!isOpen || !isLlama || !modelPath) return;
+    let cancelled = false;
+    setContextLoading(true);
+    invoke<any>("llamacpp_context_info", {
+      modelPath,
+      llamaOffloadKqv: draft.llamaOffloadKqv ?? null,
+      llamaKvType: draft.llamaKvType ?? null,
+      llamaGpuLayers: draft.llamaGpuLayers ?? null,
+    })
+      .then((info) => {
+        if (!cancelled) setContextInfo(info);
+      })
+      .catch(() => {
+        if (!cancelled) setContextInfo(null);
+      })
+      .finally(() => {
+        if (!cancelled) setContextLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen, isLlama, modelPath, draft.llamaOffloadKqv, draft.llamaKvType, draft.llamaGpuLayers]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [isOpen, onClose]);
+
+  useEffect(() => {
+    if (!isCpuOnlyLlamaBackend) {
+      return;
+    }
+    if (draft.llamaGpuLayers === 0 && draft.llamaOffloadKqv === false) {
+      return;
+    }
+    onDraftChange({
+      ...draft,
+      llamaGpuLayers: 0,
+      llamaOffloadKqv: false,
+    });
+  }, [draft, isCpuOnlyLlamaBackend, onDraftChange]);
+
+  const handleReset = () => {
+    onOverrideEnabledChange(false);
+    onDraftChange(baseSettings);
+    onSave(null);
+  };
+
+  const handleSave = () => {
+    onSave(overrideEnabled ? draft : null);
+  };
+
+  const update = (patch: Partial<AdvancedModelSettings>) => {
+    onDraftChange({ ...draft, ...patch });
+  };
+
+  return (
+    <AnimatePresence>
+      {isOpen && (
+        <motion.div
+          className="fixed inset-x-0 bottom-0 top-[var(--titlebar-h,0px)] z-50 flex flex-col bg-surface"
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          exit={{ opacity: 0, y: 20 }}
+          transition={{ duration: 0.2 }}
+        >
+          {/* Header */}
+          <div
+            className="flex shrink-0 items-center justify-between border-b border-fg/10 px-4 py-3"
+          >
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                onClick={onClose}
+                className="rounded-full border border-fg/10 p-2 text-fg/60 transition hover:bg-fg/10 hover:text-fg"
+                aria-label={t("sessionAdvanced.goBack")}
+              >
+                <ArrowLeft size={16} />
+              </button>
+              <div>
+                <h2 className="text-base font-semibold text-fg">{t("sessionAdvanced.title")}</h2>
+                <p className="text-xs text-fg/45">{t("sessionAdvanced.subtitle")}</p>
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={onShowParameterSupport}
+                className="rounded-full border border-fg/10 px-3 py-1.5 text-xs font-medium text-fg/60 transition hover:bg-fg/10 hover:text-fg"
+              >
+                <Info size={14} className="inline mr-1" />
+                {t("sessionAdvanced.support")}
+              </button>
+              <button
+                type="button"
+                onClick={handleReset}
+                className="rounded-full border border-fg/10 px-3 py-1.5 text-xs font-medium text-fg/60 transition hover:bg-fg/10 hover:text-fg"
+              >
+                <RotateCcw size={14} className="inline mr-1" />
+                {t("sessionAdvanced.reset")}
+              </button>
+              <button
+                type="button"
+                onClick={handleSave}
+                className={cn(
+                  "rounded-full px-3 py-1.5 text-xs font-semibold text-fg transition",
+                  "bg-linear-to-r from-accent to-accent/80",
+                  "hover:from-accent/80 hover:to-accent/60",
+                )}
+              >
+                <Save size={14} className="inline mr-1" />
+                {t("sessionAdvanced.save")}
+              </button>
+            </div>
+          </div>
+
+          {/* Content */}
+          <div className="flex-1 overflow-y-auto px-4 py-6">
+            <div className="mx-auto max-w-3xl space-y-6">
+              {!hasSession && (
+                <div className="rounded-xl border border-warning/20 bg-warning/10 px-4 py-3 text-sm text-warning/80">
+                  {t("sessionAdvanced.noSessionWarning")}
+                </div>
+              )}
+
+              {hasSession && (
+                <>
+                  {/* Override toggle */}
+                  <div className="flex items-center justify-between rounded-xl border border-fg/10 bg-fg/[0.03] px-4 py-3">
+                    <div>
+                      <p className="text-sm font-medium text-fg/90">
+                        {t("sessionAdvanced.overrideDefaults")}
+                      </p>
+                      <p className="mt-0.5 text-xs text-fg/45">
+                        {t("sessionAdvanced.overrideDefaultsDesc")}
+                      </p>
+                    </div>
+                    <Switch checked={overrideEnabled} onChange={onOverrideEnabledChange} />
+                  </div>
+
+                  {overrideEnabled && (
+                    <>
+                      <div className="grid grid-cols-1 gap-6 md:grid-cols-2">
+                        {/* Sampling */}
+                        <div className="space-y-5 rounded-xl border border-fg/8 bg-fg/[0.02] p-4">
+                          <h3 className="text-[11px] font-bold uppercase tracking-wider text-fg/40">
+                            {t("sessionAdvanced.sampling.title")}
+                          </h3>
+
+                          <ParameterField
+                            label={t("sessionAdvanced.sampling.temperature")}
+                            description={t("sessionAdvanced.sampling.temperatureDesc")}
+                            value={draft.temperature}
+                            placeholder="0.70"
+                            min={ADVANCED_TEMPERATURE_RANGE.min}
+                            max={ADVANCED_TEMPERATURE_RANGE.max}
+                            step={0.01}
+                            onChange={(v) => update({ temperature: v })}
+                            rangeLabels={[
+                              t("sessionAdvanced.sampling.temperaturePrecise"),
+                              t("sessionAdvanced.sampling.temperatureCreative"),
+                            ]}
+                          />
+
+                          <ParameterField
+                            label={t("sessionAdvanced.sampling.topP")}
+                            description={t("sessionAdvanced.sampling.topPDesc")}
+                            value={draft.topP}
+                            placeholder="1.00"
+                            min={ADVANCED_TOP_P_RANGE.min}
+                            max={ADVANCED_TOP_P_RANGE.max}
+                            step={0.01}
+                            onChange={(v) => update({ topP: v })}
+                            rangeLabels={[
+                              t("sessionAdvanced.sampling.topPFocused"),
+                              t("sessionAdvanced.sampling.topPDiverse"),
+                            ]}
+                          />
+
+                          <ParameterField
+                            label={t("sessionAdvanced.sampling.topK")}
+                            description={t("sessionAdvanced.sampling.topKDesc")}
+                            value={draft.topK}
+                            placeholder="40"
+                            min={ADVANCED_TOP_K_RANGE.min}
+                            max={ADVANCED_TOP_K_RANGE.max}
+                            step={1}
+                            onChange={(v) => update({ topK: v })}
+                            inputMode="numeric"
+                          />
+
+                          {isLlama && (
+                            <>
+                              <ParameterField
+                                label={t("sessionAdvanced.samplingMemory.minP")}
+                                description={t("sessionAdvanced.samplingMemory.minPDesc")}
+                                value={draft.llamaMinP}
+                                placeholder={t("sessionAdvanced.defaultPlaceholder")}
+                                min={0}
+                                max={1}
+                                step={0.01}
+                                onChange={(v) => update({ llamaMinP: v })}
+                              />
+
+                              <ParameterField
+                                label={t("sessionAdvanced.samplingMemory.typicalP")}
+                                description={t("sessionAdvanced.samplingMemory.typicalPDesc")}
+                                value={draft.llamaTypicalP}
+                                placeholder={t("sessionAdvanced.defaultPlaceholder")}
+                                min={0}
+                                max={1}
+                                step={0.01}
+                                onChange={(v) => update({ llamaTypicalP: v })}
+                              />
+
+                              <ParameterField
+                                label={t("sessionAdvanced.samplingMemory.xtcProbability")}
+                                description={t("sessionAdvanced.samplingMemory.xtcProbabilityDesc")}
+                                value={draft.llamaXtcProbability}
+                                placeholder={t("sessionAdvanced.defaultPlaceholder")}
+                                min={ADVANCED_LLAMA_XTC_PROBABILITY_RANGE.min}
+                                max={ADVANCED_LLAMA_XTC_PROBABILITY_RANGE.max}
+                                step={0.01}
+                                onChange={(v) => update({ llamaXtcProbability: v })}
+                              />
+
+                              <ParameterField
+                                label={t("sessionAdvanced.samplingMemory.xtcThreshold")}
+                                description={t("sessionAdvanced.samplingMemory.xtcThresholdDesc")}
+                                value={draft.llamaXtcThreshold}
+                                placeholder="0.10"
+                                min={ADVANCED_LLAMA_XTC_THRESHOLD_RANGE.min}
+                                max={ADVANCED_LLAMA_XTC_THRESHOLD_RANGE.max}
+                                step={0.01}
+                                onChange={(v) => update({ llamaXtcThreshold: v })}
+                              />
+
+                              <ParameterField
+                                label={t("sessionAdvanced.samplingMemory.seed")}
+                                description={t("sessionAdvanced.samplingMemory.seedDesc")}
+                                value={draft.llamaSeed}
+                                placeholder={t("sessionAdvanced.randomPlaceholder")}
+                                min={0}
+                                max={2147483647}
+                                step={1}
+                                onChange={(v) => update({ llamaSeed: v })}
+                                inputMode="numeric"
+                              />
+
+                              <div className="space-y-2">
+                                <label className="text-[13px] font-medium text-fg/80">
+                                  {t("sessionAdvanced.samplingMemory.samplerProfile")}
+                                </label>
+                                <p className="text-[11px] text-fg/40 leading-relaxed">
+                                  {t("sessionAdvanced.samplingMemory.samplerProfileDesc")}
+                                </p>
+                                <select
+                                  value={draft.llamaSamplerProfile ?? "balanced"}
+                                  onChange={(e) => {
+                                    const val = e.target.value;
+                                    update({
+                                      llamaSamplerProfile: val === "balanced" ? null : (val as any),
+                                    });
+                                  }}
+                                  className="w-full rounded-lg border border-fg/10 bg-fg/5 px-3 py-2 text-sm text-fg transition focus:border-fg/20 focus:outline-none"
+                                >
+                                  <option value="balanced">{t("sessionAdvanced.samplingMemory.balanced")}</option>
+                                  <option value="creative">{t("sessionAdvanced.samplingMemory.creative")}</option>
+                                  <option value="stable">{t("sessionAdvanced.samplingMemory.stable")}</option>
+                                  <option value="reasoning">{t("sessionAdvanced.samplingMemory.reasoning")}</option>
+                                </select>
+                              </div>
+
+                              <ParameterField
+                                label={t("editModel.ollamaParams.repeatPenalty")}
+                                description={t("editModel.ollamaParams.repeatPenaltyDescription")}
+                                value={draft.llamaRepeatPenalty}
+                                placeholder="1.00"
+                                min={ADVANCED_LLAMA_REPEAT_PENALTY_RANGE.min}
+                                max={ADVANCED_LLAMA_REPEAT_PENALTY_RANGE.max}
+                                step={0.01}
+                                onChange={(v) => update({ llamaRepeatPenalty: v })}
+                              />
+
+                              <ParameterField
+                                label={t("editModel.llamaSampler.penaltyRange")}
+                                description={t("editModel.llamaSampler.penaltyRangeDescription")}
+                                value={draft.llamaNPenRange}
+                                placeholder="-1"
+                                min={ADVANCED_LLAMA_N_PEN_RANGE.min}
+                                max={ADVANCED_LLAMA_N_PEN_RANGE.max}
+                                step={1}
+                                onChange={(v) => update({ llamaNPenRange: v })}
+                                inputMode="numeric"
+                              />
+
+                              <ParameterField
+                                label={t("sessionAdvanced.dry.multiplier")}
+                                description={t("sessionAdvanced.dry.multiplierDesc")}
+                                value={draft.llamaDryMultiplier}
+                                placeholder="0.80"
+                                min={ADVANCED_LLAMA_DRY_MULTIPLIER_RANGE.min}
+                                max={ADVANCED_LLAMA_DRY_MULTIPLIER_RANGE.max}
+                                step={0.05}
+                                onChange={(v) => update({ llamaDryMultiplier: v })}
+                              />
+
+                              <ParameterField
+                                label={t("sessionAdvanced.dry.base")}
+                                description={t("sessionAdvanced.dry.baseDesc")}
+                                value={draft.llamaDryBase}
+                                placeholder="1.75"
+                                min={ADVANCED_LLAMA_DRY_BASE_RANGE.min}
+                                max={ADVANCED_LLAMA_DRY_BASE_RANGE.max}
+                                step={0.05}
+                                onChange={(v) => update({ llamaDryBase: v })}
+                              />
+
+                              <ParameterField
+                                label={t("sessionAdvanced.dry.allowedLength")}
+                                description={t("sessionAdvanced.dry.allowedLengthDesc")}
+                                value={draft.llamaDryAllowedLength}
+                                placeholder="2"
+                                min={ADVANCED_LLAMA_DRY_ALLOWED_LENGTH_RANGE.min}
+                                max={ADVANCED_LLAMA_DRY_ALLOWED_LENGTH_RANGE.max}
+                                step={1}
+                                onChange={(v) => update({ llamaDryAllowedLength: v })}
+                                inputMode="numeric"
+                              />
+
+                              <ParameterField
+                                label={t("sessionAdvanced.dry.penaltyLastN")}
+                                description={t("sessionAdvanced.dry.penaltyLastNDesc")}
+                                value={draft.llamaDryPenaltyLastN}
+                                placeholder="-1"
+                                min={ADVANCED_LLAMA_DRY_PENALTY_LAST_N_RANGE.min}
+                                max={ADVANCED_LLAMA_DRY_PENALTY_LAST_N_RANGE.max}
+                                step={1}
+                                onChange={(v) => update({ llamaDryPenaltyLastN: v })}
+                                inputMode="numeric"
+                              />
+
+                              <div className="space-y-2">
+                                <label className="text-[13px] font-medium text-fg/80">
+                                  {t("sessionAdvanced.dry.sequenceBreakers")}
+                                </label>
+                                <p className="text-[11px] text-fg/40 leading-relaxed">
+                                  {t("sessionAdvanced.dry.sequenceBreakersDesc")}
+                                </p>
+                                <input
+                                  type="text"
+                                  value={draft.llamaDrySequenceBreakers?.join(", ") ?? ""}
+                                  onChange={(e) => {
+                                    const next = e.target.value
+                                      .split(",")
+                                      .map((item) => item.trim())
+                                      .filter((item) => item.length > 0);
+                                    update({
+                                      llamaDrySequenceBreakers: next.length ? next : null,
+                                    });
+                                  }}
+                                  placeholder={'\\n, :, ", *'}
+                                  className="w-full rounded-lg border border-fg/10 bg-fg/5 px-3 py-2 text-sm text-fg transition focus:border-fg/20 focus:outline-none"
+                                />
+                              </div>
+
+                              <LlamaSamplerOrderEditor
+                                value={draft.llamaSamplerOrder}
+                                onChange={(llamaSamplerOrder) => update({ llamaSamplerOrder })}
+                              />
+                            </>
+                          )}
+                        </div>
+
+                        {/* Output & Penalties */}
+                        <div className="space-y-5 rounded-xl border border-fg/8 bg-fg/[0.02] p-4">
+                          <h3 className="text-[11px] font-bold uppercase tracking-wider text-fg/40">
+                            {t("sessionAdvanced.outputPenalties.title")}
+                          </h3>
+
+                          <div className="space-y-2">
+                            <div className="flex items-baseline justify-between gap-2">
+                              <label className="text-[13px] font-medium text-fg/80">
+                                {t("sessionAdvanced.outputPenalties.maxOutputTokens")}
+                              </label>
+                            </div>
+                            <p className="text-[11px] text-fg/40 leading-relaxed">
+                              {t("sessionAdvanced.outputPenalties.maxOutputTokensDesc")}
+                            </p>
+                            <div className="flex gap-2">
+                              <button
+                                type="button"
+                                onClick={() => update({ maxOutputTokens: null })}
+                                className={cn(
+                                  "flex-1 rounded-lg px-3 py-2 text-xs font-medium transition",
+                                  !draft.maxOutputTokens
+                                    ? "bg-accent/15 text-accent"
+                                    : "border border-fg/10 text-fg/50 hover:bg-fg/5",
+                                )}
+                              >
+                                {t("sessionAdvanced.outputPenalties.auto")}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => update({ maxOutputTokens: 2048 })}
+                                className={cn(
+                                  "flex-1 rounded-lg px-3 py-2 text-xs font-medium transition",
+                                  draft.maxOutputTokens
+                                    ? "bg-accent/15 text-accent"
+                                    : "border border-fg/10 text-fg/50 hover:bg-fg/5",
+                                )}
+                              >
+                                {t("sessionAdvanced.outputPenalties.custom")}
+                              </button>
+                            </div>
+                            {draft.maxOutputTokens != null && (
+                              <NumberInput
+                                min={ADVANCED_MAX_TOKENS_RANGE.min}
+                                max={ADVANCED_MAX_TOKENS_RANGE.max}
+                                value={draft.maxOutputTokens}
+                                onChange={(next) => update({ maxOutputTokens: next ?? 0 })}
+                                placeholder="2048"
+                                className="w-full rounded-lg border border-fg/10 bg-fg/5 px-3 py-2 text-sm text-fg placeholder-fg/30 transition focus:border-fg/20 focus:outline-none"
+                              />
+                            )}
+                          </div>
+
+                          <ParameterField
+                            label={t("sessionAdvanced.outputPenalties.frequencyPenalty")}
+                            description={t("sessionAdvanced.outputPenalties.frequencyPenaltyDesc")}
+                            value={draft.frequencyPenalty}
+                            placeholder="0.00"
+                            min={ADVANCED_FREQUENCY_PENALTY_RANGE.min}
+                            max={ADVANCED_FREQUENCY_PENALTY_RANGE.max}
+                            step={0.01}
+                            onChange={(v) => update({ frequencyPenalty: v })}
+                            rangeLabels={[
+                              t("sessionAdvanced.outputPenalties.frequencyPenaltyRepeat"),
+                              t("sessionAdvanced.outputPenalties.frequencyPenaltyVary"),
+                            ]}
+                          />
+
+                          <ParameterField
+                            label={t("sessionAdvanced.outputPenalties.presencePenalty")}
+                            description={t("sessionAdvanced.outputPenalties.presencePenaltyDesc")}
+                            value={draft.presencePenalty}
+                            placeholder="0.00"
+                            min={ADVANCED_PRESENCE_PENALTY_RANGE.min}
+                            max={ADVANCED_PRESENCE_PENALTY_RANGE.max}
+                            step={0.01}
+                            onChange={(v) => update({ presencePenalty: v })}
+                            rangeLabels={[
+                              t("sessionAdvanced.outputPenalties.presencePenaltyRepeat"),
+                              t("sessionAdvanced.outputPenalties.presencePenaltyExplore"),
+                            ]}
+                          />
+                        </div>
+                      </div>
+
+                      {/* Runtime (llama.cpp only) */}
+                      {isLlama && (
+                        <div className="space-y-6">
+                          {/* Performance */}
+                          <div className="rounded-xl border border-fg/8 bg-fg/[0.02] p-4">
+                            <h3 className="mb-5 text-[11px] font-bold uppercase tracking-wider text-fg/40">
+                              {t("sessionAdvanced.performance.title")}
+                            </h3>
+                            <div className="grid grid-cols-1 gap-6 md:grid-cols-3">
+                              <ParameterField
+                                label={t("sessionAdvanced.performance.gpuLayers")}
+                                description={
+                                  isCpuOnlyLlamaBackend
+                                    ? t("sessionAdvanced.performance.cpuOnlyDisabled")
+                                    : t("sessionAdvanced.performance.gpuLayersDesc")
+                                }
+                                value={draft.llamaGpuLayers}
+                                placeholder={t("sessionAdvanced.performance.autoPlaceholder")}
+                                min={0}
+                                max={512}
+                                step={1}
+                                onChange={(v) => update({ llamaGpuLayers: v })}
+                                inputMode="numeric"
+                                disabled={isCpuOnlyLlamaBackend}
+                              />
+
+                              <ParameterField
+                                label={t("sessionAdvanced.performance.threads")}
+                                description={t("sessionAdvanced.performance.threadsDesc")}
+                                value={draft.llamaThreads}
+                                placeholder={t("sessionAdvanced.performance.autoPlaceholder")}
+                                min={1}
+                                max={256}
+                                step={1}
+                                onChange={(v) => update({ llamaThreads: v })}
+                                inputMode="numeric"
+                              />
+
+                              <ParameterField
+                                label={t("sessionAdvanced.performance.batchThreads")}
+                                description={t("sessionAdvanced.performance.batchThreadsDesc")}
+                                value={draft.llamaThreadsBatch}
+                                placeholder={t("sessionAdvanced.performance.autoPlaceholder")}
+                                min={1}
+                                max={256}
+                                step={1}
+                                onChange={(v) => update({ llamaThreadsBatch: v })}
+                                inputMode="numeric"
+                              />
+
+                              <ParameterField
+                                label={t("sessionAdvanced.performance.batchSize")}
+                                description={t("sessionAdvanced.performance.batchSizeDesc")}
+                                value={draft.llamaBatchSize}
+                                placeholder="512"
+                                min={1}
+                                max={8192}
+                                step={1}
+                                onChange={(v) => update({ llamaBatchSize: v })}
+                                inputMode="numeric"
+                              />
+
+                              <ParameterField
+                                label={t("sessionAdvanced.performance.contextLength")}
+                                description={t("sessionAdvanced.performance.contextLengthDesc")}
+                                value={draft.contextLength}
+                                placeholder={t("sessionAdvanced.performance.autoPlaceholder")}
+                                min={0}
+                                max={262144}
+                                step={1}
+                                onChange={(v) => update({ contextLength: v })}
+                                inputMode="numeric"
+                              />
+
+                              <div className="space-y-2">
+                                <label className="text-[13px] font-medium text-fg/80">
+                                  {t("sessionAdvanced.performance.flashAttention")}
+                                </label>
+                                <p className="text-[11px] text-fg/40 leading-relaxed">
+                                  {t("sessionAdvanced.performance.flashAttentionDesc")}
+                                </p>
+                                <select
+                                  value={draft.llamaFlashAttention ?? "auto"}
+                                  onChange={(e) => {
+                                    const val = e.target.value;
+                                    update({
+                                      llamaFlashAttention:
+                                        val === "auto" ? null : (val as "enabled" | "disabled"),
+                                    });
+                                  }}
+                                  className="w-full rounded-lg border border-fg/10 bg-fg/5 px-3 py-2 text-sm text-fg transition focus:border-fg/20 focus:outline-none"
+                                >
+                                  <option value="auto">{t("sessionAdvanced.performance.autoOption")}</option>
+                                  <option value="enabled">{t("sessionAdvanced.performance.enabled")}</option>
+                                  <option value="disabled">{t("sessionAdvanced.performance.disabled")}</option>
+                                </select>
+                              </div>
+                          </div>
+                        </div>
+
+                        <div className="rounded-xl border border-fg/8 bg-fg/[0.02] p-4">
+                          <div className="flex items-start justify-between gap-4">
+                            <div className="min-w-0 space-y-1.5">
+                              <div className="flex items-start gap-3">
+                                <div className="mt-0.5 shrink-0 text-accent/80">
+                                  <Info className="h-4 w-4" />
+                                </div>
+                                <div className="min-w-0 space-y-1">
+                                  <span className="block text-[13px] font-medium text-fg/82">
+                                    {t("sessionAdvanced.streaming.title")}
+                                  </span>
+                                  <span className="block text-[13px] leading-relaxed text-fg/48">
+                                    {t("sessionAdvanced.streaming.description")}
+                                  </span>
+                                </div>
+                              </div>
+                              <span className="block text-[12px] text-fg/42">
+                                {t("sessionAdvanced.streaming.hint")}
+                              </span>
+                            </div>
+                            <div className="flex shrink-0 items-center gap-3">
+                              <span
+                                className={cn(
+                                  "text-[12px] font-medium transition",
+                                  draft.llamaStreamingEnabled !== false
+                                    ? "text-accent/80"
+                                    : "text-fg/42",
+                                )}
+                              >
+                                {draft.llamaStreamingEnabled !== false
+                                  ? t("sessionAdvanced.streaming.on")
+                                  : t("sessionAdvanced.streaming.off")}
+                              </span>
+                              <Switch
+                                id="llama-streaming-enabled-session"
+                                checked={draft.llamaStreamingEnabled !== false}
+                                onChange={(next) =>
+                                  update({ llamaStreamingEnabled: next ? true : false })
+                                }
+                                aria-label={t("sessionAdvanced.streaming.toggleAria")}
+                              />
+                            </div>
+                          </div>
+                        </div>
+
+                          {/* Sampling & Memory */}
+                          <div className="rounded-xl border border-fg/8 bg-fg/[0.02] p-4">
+                            <h3 className="mb-5 text-[11px] font-bold uppercase tracking-wider text-fg/40">
+                              {t("sessionAdvanced.samplingMemory.title")}
+                            </h3>
+                            <div className="grid grid-cols-1 gap-6 md:grid-cols-3">
+                              <ParameterField
+                                label={t("sessionAdvanced.samplingMemory.ropeBase")}
+                                description={t("sessionAdvanced.samplingMemory.ropeBaseDesc")}
+                                value={draft.llamaRopeFreqBase}
+                                placeholder={t("sessionAdvanced.performance.autoPlaceholder")}
+                                min={0}
+                                max={1000000}
+                                step={0.1}
+                                onChange={(v) => update({ llamaRopeFreqBase: v })}
+                              />
+
+                              <ParameterField
+                                label={t("sessionAdvanced.samplingMemory.ropeScale")}
+                                description={t("sessionAdvanced.samplingMemory.ropeScaleDesc")}
+                                value={draft.llamaRopeFreqScale}
+                                placeholder={t("sessionAdvanced.performance.autoPlaceholder")}
+                                min={0}
+                                max={10}
+                                step={0.01}
+                                onChange={(v) => update({ llamaRopeFreqScale: v })}
+                              />
+
+                              <div className="space-y-2">
+                                <label className="text-[13px] font-medium text-fg/80">
+                                  {t("sessionAdvanced.samplingMemory.kvCacheType")}
+                                </label>
+                                <p className="text-[11px] text-fg/40 leading-relaxed">
+                                  {t("sessionAdvanced.samplingMemory.kvCacheTypeDesc")}
+                                </p>
+                                <select
+                                  value={draft.llamaKvType ?? "auto"}
+                                  onChange={(e) => {
+                                    const val = e.target.value;
+                                    update({ llamaKvType: val === "auto" ? null : (val as any) });
+                                  }}
+                                  className="w-full rounded-lg border border-fg/10 bg-fg/5 px-3 py-2 text-sm text-fg transition focus:border-fg/20 focus:outline-none"
+                                >
+                                  <option value="auto">{t("sessionAdvanced.performance.autoOption")}</option>
+                                  <option value="f16">F16</option>
+                                  <option value="q8_0">Q8_0</option>
+                                  <option value="q4_0">Q4_0</option>
+                                </select>
+                              </div>
+
+                              <div className="space-y-2">
+                                <label className="text-[13px] font-medium text-fg/80">
+                                  {t("sessionAdvanced.samplingMemory.offloadKqv")}
+                                </label>
+                                <p className="text-[11px] text-fg/40 leading-relaxed">
+                                  {isCpuOnlyLlamaBackend
+                                    ? t("sessionAdvanced.performance.cpuOnlyDisabled")
+                                    : t("sessionAdvanced.samplingMemory.offloadKqvDesc")}
+                                </p>
+                                <select
+                                  value={
+                                    draft.llamaOffloadKqv == null
+                                      ? "auto"
+                                      : draft.llamaOffloadKqv
+                                        ? "on"
+                                        : "off"
+                                  }
+                                  onChange={(e) => {
+                                    const val = e.target.value;
+                                    update({
+                                      llamaOffloadKqv: val === "auto" ? null : val === "on",
+                                    });
+                                  }}
+                                  disabled={isCpuOnlyLlamaBackend}
+                                  className={cn(
+                                    "w-full rounded-lg border border-fg/10 bg-fg/5 px-3 py-2 text-sm text-fg transition focus:border-fg/20 focus:outline-none",
+                                    isCpuOnlyLlamaBackend && "cursor-not-allowed opacity-60",
+                                  )}
+                                >
+                                  <option value="auto">{t("sessionAdvanced.performance.autoOption")}</option>
+                                  <option value="on">{t("sessionAdvanced.samplingMemory.on")}</option>
+                                  <option value="off">{t("sessionAdvanced.samplingMemory.off")}</option>
+                                </select>
+                              </div>
+                            </div>
+                          </div>
+
+                          {/* Context Info */}
+                          {contextInfo && (
+                            <div className="rounded-xl border border-fg/8 bg-fg/[0.02] p-4">
+                              <h3 className="mb-4 text-[11px] font-bold uppercase tracking-wider text-fg/40">
+                                {t("sessionAdvanced.systemInfo.title")}
+                              </h3>
+                              <div className="grid grid-cols-2 gap-3 text-[12px] md:grid-cols-5">
+                                <div>
+                                  <div className="text-fg/35">{t("sessionAdvanced.systemInfo.maxContext")}</div>
+                                  <div className="font-mono text-fg/75">
+                                    {contextInfo.maxContextLength?.toLocaleString()}
+                                  </div>
+                                </div>
+                                {contextInfo.recommendedContextLength != null && (
+                                  <div>
+                                    <div className="text-fg/35">{t("sessionAdvanced.systemInfo.recommended")}</div>
+                                    <div className="font-mono text-fg/75">
+                                      {contextInfo.recommendedContextLength.toLocaleString()}
+                                    </div>
+                                  </div>
+                                )}
+                                {contextInfo.availableMemoryBytes != null && (
+                                  <div>
+                                    <div className="text-fg/35">{t("sessionAdvanced.systemInfo.availableRam")}</div>
+                                    <div className="font-mono text-fg/75">
+                                      {(contextInfo.availableMemoryBytes / 1073741824).toFixed(1)}{" "}
+                                      GB
+                                    </div>
+                                  </div>
+                                )}
+                                {contextInfo.availableVramBytes != null && (
+                                  <div>
+                                    <div className="text-fg/35">{t("sessionAdvanced.systemInfo.availableVram")}</div>
+                                    <div className="font-mono text-fg/75">
+                                      {(contextInfo.availableVramBytes / 1073741824).toFixed(1)} GB
+                                    </div>
+                                  </div>
+                                )}
+                                {contextInfo.modelSizeBytes != null && (
+                                  <div>
+                                    <div className="text-fg/35">{t("sessionAdvanced.systemInfo.modelSize")}</div>
+                                    <div className="font-mono text-fg/75">
+                                      {(contextInfo.modelSizeBytes / 1073741824).toFixed(1)} GB
+                                    </div>
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                          )}
+                          {contextLoading && (
+                            <div className="flex items-center gap-2 text-[12px] text-fg/40">
+                              <Loader className="h-3.5 w-3.5 animate-spin" />
+                              {t("sessionAdvanced.loadingContextInfo")}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+        </motion.div>
+      )}
+    </AnimatePresence>
+  );
+}

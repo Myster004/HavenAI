@@ -1,0 +1,227 @@
+name: PR Check
+
+on:
+  pull_request:
+    paths-ignore:
+      - "**/*.md"
+      - "LICENSE"
+  workflow_dispatch:
+
+concurrency:
+  group: pr-check-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NDK_VERSION: r26d
+
+jobs:
+  frontend:
+    name: Frontend Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "latest"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build frontend
+        run: bun run build
+
+  linux:
+    name: Linux Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: ./.github/actions/setup-rust-build
+        with:
+          cache-key: linux-check
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            libclang-dev \
+            llvm-dev \
+            pkg-config \
+            libssl-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libwebkit2gtk-4.1-dev \
+            libspeechd-dev \
+            patchelf \
+            zip
+
+      - name: Configure Linux clang toolchain
+        run: |
+          echo "CLANG_PATH=$(command -v clang)" >> "$GITHUB_ENV"
+          LIBCLANG_PATH="$(dirname "$(find /usr/lib -path '*/libclang.so*' | sort | tail -n1)")"
+          echo "LIBCLANG_PATH=$LIBCLANG_PATH" >> "$GITHUB_ENV"
+          printf '#include <stdbool.h>\n' | clang -E -x c - >/dev/null
+
+      - name: Run Rust check
+        run: cargo check --manifest-path src-tauri/Cargo.toml
+
+  android:
+    name: Android Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: ./.github/actions/setup-rust-build
+        with:
+          cache-key: android-check
+          target: aarch64-linux-android
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          link-to-sdk: true
+
+      - name: Install Android/Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            pkg-config \
+            libssl-dev \
+            perl
+
+      - name: Configure Android OpenSSL toolchain
+        run: |
+          NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+
+          echo "Using NDK at $NDK"
+          echo "Using toolchain bin at $TOOLCHAIN"
+
+          echo "$TOOLCHAIN" >> "$GITHUB_PATH"
+
+          sudo ln -sf "$TOOLCHAIN/aarch64-linux-android21-clang" /usr/local/bin/aarch64-linux-android-clang
+          sudo ln -sf "$TOOLCHAIN/aarch64-linux-android21-clang++" /usr/local/bin/aarch64-linux-android-clang++
+          sudo ln -sf "$TOOLCHAIN/llvm-ar" /usr/local/bin/aarch64-linux-android-ar
+          sudo ln -sf "$TOOLCHAIN/llvm-ranlib" /usr/local/bin/aarch64-linux-android-ranlib
+
+          {
+            echo "ANDROID_NDK_HOME=$NDK"
+            echo "ANDROID_NDK_ROOT=$NDK"
+            echo "NDK_HOME=$NDK"
+            echo "CC_aarch64_linux_android=$TOOLCHAIN/aarch64-linux-android21-clang"
+            echo "CXX_aarch64_linux_android=$TOOLCHAIN/aarch64-linux-android21-clang++"
+            echo "AR_aarch64_linux_android=$TOOLCHAIN/llvm-ar"
+            echo "RANLIB_aarch64_linux_android=$TOOLCHAIN/llvm-ranlib"
+            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$TOOLCHAIN/aarch64-linux-android21-clang"
+          } >> "$GITHUB_ENV"
+
+      - name: Run Android Rust check
+        working-directory: src-tauri
+        env:
+          ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
+          ANDROID_HOME: ${{ env.ANDROID_SDK_ROOT }}
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+          NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          RUST_BACKTRACE: 1
+        run: cargo check --target aarch64-linux-android
+
+  macos:
+    name: macOS Check
+    runs-on: macos-14
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: ./.github/actions/setup-rust-build
+        with:
+          cache-key: macos-check
+
+      - name: Run Rust check
+        run: cargo check --manifest-path src-tauri/Cargo.toml
+
+  windows:
+    name: Windows Check
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      CARGO_TARGET_DIR: C:\t
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Enable Windows long paths
+        shell: pwsh
+        run: |
+          git config --system core.longpaths true
+          reg add "HKLM\SYSTEM\CurrentControlSet\Control\FileSystem" /v LongPathsEnabled /t REG_DWORD /d 1 /f
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Setup CMake
+        uses: lukka/get-cmake@latest
+
+      - name: Ensure Chocolatey
+        shell: pwsh
+        run: |
+          if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
+            Set-ExecutionPolicy Bypass -Scope Process -Force
+            [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+            Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+          }
+          choco --version
+
+      - name: Install LLVM (libclang)
+        shell: pwsh
+        run: |
+          choco install llvm -y --no-progress
+          echo "LIBCLANG_PATH=C:\\Program Files\\LLVM\\bin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install Rust
+        uses: ./.github/actions/setup-rust-build
+        with:
+          cache-key: windows-check
+          cache-workspaces: src-tauri -> C:\t
+
+      - name: Run Rust check
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:CARGO_TARGET_DIR | Out-Null
+          cargo check --manifest-path src-tauri/Cargo.toml

@@ -1,0 +1,273 @@
+use crate::chat_manager::provider_adapter::adapter_for;
+use crate::chat_manager::types::{ProviderCredential, ProviderId};
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderConfig {
+    pub id: String,
+    pub name: String,
+    pub default_base_url: String,
+    pub api_endpoint_path: String,
+    pub system_role: String,
+    pub supports_stream: bool,
+    pub requires_api_key: bool,
+    pub required_auth_headers: Vec<String>,
+    pub default_headers: HashMap<String, String>,
+    #[serde(default)]
+    pub supported_extra_body_keys: Vec<String>,
+}
+
+fn supported_extra_body_keys(provider_id: &str) -> &'static [&'static str] {
+    match provider_id {
+        "llamacpp" => &[
+            "llamaGpuLayers",
+            "llamaMultiGpuEnabled",
+            "llamaGpuDeviceIds",
+            "llamaGpuDistributionMode",
+            "llamaGpuManualLayers",
+            "llamaKvPlacement",
+            "llamaMainGpu",
+            "llamaSingleGpuDeviceId",
+            "llamaPriorityVramLimitBytes",
+            "llamaThreads",
+            "llamaThreadsBatch",
+            "llamaSeed",
+            "llamaRopeFreqBase",
+            "llamaRopeFreqScale",
+            "llamaOffloadKqv",
+            "llamaBatchSize",
+            "llamaUbatchSize",
+            "llamaKvType",
+            "llamaFlashAttentionPolicy",
+            "llamaSwaFull",
+            "llamaChatTemplateOverride",
+            "llamaMmprojPath",
+            "llamaChatTemplatePreset",
+            "llamaRawCompletionFallback",
+            "llamaStreamingEnabled",
+            "llamaStrictMode",
+            "llamaMtpEnabled",
+            "llamaMtpPlacement",
+            "llamaMtpDraftTokens",
+            "llamaMtpModelPath",
+            "llamaSamplerProfile",
+            "llamaSamplerOrder",
+            "llamaMinP",
+            "llamaTypicalP",
+            "llamaRepeatPenalty",
+            "llamaNPenRange",
+            "n_pen_range",
+            "nPenRange",
+            "penalty_last_n",
+            "repeat_last_n",
+            "repeat_penalty",
+            "repeatPenalty",
+            "llamaDryMultiplier",
+            "llamaDryBase",
+            "llamaDryAllowedLength",
+            "llamaDryPenaltyLastN",
+            "llamaDrySequenceBreakers",
+            "llamaXtcProbability",
+            "llamaXtcThreshold",
+            "llamaDisableSamplerProfileDefaults",
+            "min_p",
+            "typical_p",
+            "parallel_tool_calls",
+            "top_k",
+            "frequency_penalty",
+            "presence_penalty",
+            "enable_thinking",
+            "chat_template_kwargs",
+        ],
+        "ollama" => &["options"],
+        // express omitted on purpose — it uses Gemini's implicit caching, no explicit toggle
+        "openrouter" => &["promptCachingTtl", "provider"],
+        "anthropic" | "custom-anthropic" | "openai" | "gemini" | "google" | "google-gemini" => {
+            &["promptCachingTtl"]
+        }
+        _ => &[],
+    }
+}
+
+#[tauri::command]
+pub fn get_provider_configs() -> Vec<ProviderConfig> {
+    get_cached_provider_configs().clone()
+}
+
+fn path_from_url(url: &str) -> String {
+    // naive extraction of path from a URL without pulling in a URL parser
+    if let Some(scheme_idx) = url.find("://") {
+        if let Some(path_start) = url[scheme_idx + 3..].find('/') {
+            return url[scheme_idx + 3 + path_start..].to_string();
+        }
+        return "/".to_string();
+    }
+    // already looks like a path
+    url.to_string()
+}
+
+fn get_all_provider_configs_internal() -> Vec<ProviderConfig> {
+    let base_configs = vec![
+        ("aihorde", "AI Horde", "https://aihorde.net/api"),
+        ("chutes", "Chutes", "https://llm.chutes.ai"),
+        ("openai", "OpenAI", "https://api.openai.com"),
+        ("cerebras", "Cerebras", "https://api.cerebras.ai/v1"),
+        ("anthropic", "Anthropic", "https://api.anthropic.com"),
+        ("openrouter", "OpenRouter", "https://openrouter.ai/api"),
+        ("literouter", "LiteRouter", "https://api.literouter.com/v1"),
+        (
+            "pollinations",
+            "Pollinations AI",
+            "https://gen.pollinations.ai",
+        ),
+        ("mistral", "Mistral AI", "https://api.mistral.ai"),
+        ("deepseek", "DeepSeek", "https://api.deepseek.com"),
+        ("nanogpt", "NanoGPT", "https://nano-gpt.com/api"),
+        ("xai", "xAI (Grok)", "https://api.x.ai"),
+        (
+            "gemini",
+            "Google (Gemini)",
+            "https://generativelanguage.googleapis.com/v1",
+        ),
+        (
+            "gemini-agent-platform-express",
+            "Gemini Agent Platform (Express)",
+            "https://aiplatform.googleapis.com",
+        ),
+        ("zai", "zAI (GLM)", "https://api.z.ai/api/paas/v4"),
+        (
+            "moonshot",
+            "Moonshot AI (Kimi)",
+            "https://api.moonshot.ai/v1",
+        ),
+        (
+            "featherless",
+            "Featherless AI",
+            "https://api.featherless.ai/v1",
+        ),
+        (
+            "qwen",
+            "Qwen",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        ),
+        (
+            "nvidia",
+            "NVIDIA NIM",
+            "https://integrate.api.nvidia.com/v1",
+        ),
+        ("anannas", "Anannas AI", "https://api.anannas.ai/v1"),
+        ("groq", "Groq", "https://api.groq.com"),
+        ("stability", "Stability AI", "https://api.stability.ai"),
+        (
+            "automatic1111",
+            "AUTOMATIC1111 (Local)",
+            "http://127.0.0.1:7860",
+        ),
+        ("comfyui", "ComfyUI (Self-hosted)", "http://127.0.0.1:8188"),
+        (
+            "diffusers",
+            "Diffusers (Self-hosted)",
+            "http://127.0.0.1:8000",
+        ),
+        ("ollama", "Ollama (Local)", ""),
+        ("lmstudio", "LM Studio (Local)", ""),
+        (
+            "intenserp",
+            "IntenseRP Next (Local)",
+            "http://127.0.0.1:7777/v1",
+        ),
+        ("lettuce-host", "Lettuce Host", ""),
+        ("lettuce-engine", "Lettuce Engine", ""),
+        ("custom", "Custom (OpenAI-format)", ""),
+        ("custom-anthropic", "Custom (Anthropic-format)", ""),
+        ("generic_http", "Generic HTTP", "https://example.com"),
+        ("gradio", "Gradio / Hugging Face", "https://example.com"),
+    ];
+
+    base_configs
+        .into_iter()
+        .map(|(id, name, base)| {
+            let cred = ProviderCredential {
+                id: "temp".to_string(), // dummy
+                provider_id: id.to_string(),
+                label: name.to_string(),
+                api_key: None,
+                base_url: Some(base.to_string()),
+                default_model: None,
+                headers: None,
+                config: None,
+            };
+            let adapter = adapter_for(&cred);
+            let endpoint_full = adapter.endpoint(base);
+            let api_endpoint_path = path_from_url(&endpoint_full);
+            let required_auth_headers: Vec<String> = adapter
+                .required_auth_headers()
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            let default_headers = adapter.default_headers_template();
+            let supported_extra_body_keys = supported_extra_body_keys(id)
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            ProviderConfig {
+                id: id.to_string(),
+                name: name.to_string(),
+                default_base_url: base.to_string(),
+                api_endpoint_path,
+                system_role: adapter.system_role().to_string(),
+                supports_stream: adapter.supports_stream(),
+                requires_api_key: adapter.requires_api_key(),
+                required_auth_headers,
+                default_headers,
+                supported_extra_body_keys,
+            }
+        })
+        .collect()
+}
+
+fn get_cached_provider_configs() -> &'static Vec<ProviderConfig> {
+    static CACHE: OnceLock<Vec<ProviderConfig>> = OnceLock::new();
+    CACHE.get_or_init(get_all_provider_configs_internal)
+}
+
+pub fn get_provider_config(provider_id: &ProviderId) -> Option<ProviderConfig> {
+    get_cached_provider_configs()
+        .iter()
+        .find(|&p| p.id == provider_id.0)
+        .cloned()
+}
+
+pub fn supported_extra_body_keys_for_provider(provider_id: &str) -> &'static [&'static str] {
+    supported_extra_body_keys(provider_id)
+}
+
+pub fn resolve_base_url(provider_id: &ProviderId, custom_base_url: Option<&str>) -> String {
+    if let Some(custom) = custom_base_url {
+        if !custom.is_empty() {
+            return custom.trim_end_matches('/').to_string();
+        }
+    }
+
+    get_provider_config(provider_id)
+        .map(|cfg| cfg.default_base_url)
+        .unwrap_or_else(|| "https://api.openai.com".to_string())
+}
+
+#[allow(dead_code)]
+pub fn get_system_role(provider_id: &ProviderId) -> Cow<'static, str> {
+    let cred = ProviderCredential {
+        id: "temp".to_string(),
+        provider_id: provider_id.0.clone(),
+        label: "".to_string(),
+        api_key: None,
+        base_url: None,
+        default_model: None,
+        headers: None,
+        config: None,
+    };
+    adapter_for(&cred).system_role()
+}

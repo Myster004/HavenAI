@@ -1,0 +1,1068 @@
+import { motion, type PanInfo, AnimatePresence } from "framer-motion";
+import React, { useCallback, useEffect, useMemo, useState, useRef } from "react";
+import {
+  RefreshCw,
+  Pin,
+  User,
+  Bot,
+  ChevronDown,
+  Volume2,
+  Loader2,
+  Square,
+  Wand2,
+  Cpu,
+} from "lucide-react";
+import { useI18n } from "../../../../core/i18n/context";
+import { BottomMenu } from "../../../components/BottomMenu";
+import { ModelSelectionBottomMenu } from "../../../components/ModelSelectionBottomMenu";
+import { MarkdownRenderer } from "../../chats/components/MarkdownRenderer";
+import type {
+  GroupMessage,
+  GroupMessageVariant,
+  Character,
+  Persona,
+  Model,
+} from "../../../../core/storage/schemas";
+import type { ThemeColors } from "../../../../core/utils/imageAnalysis";
+import type { ChatAppearanceSettings } from "../../../../core/storage/schemas";
+import { radius, typography, interactive, cn } from "../../../design-tokens";
+import { AvatarImage } from "../../../components/AvatarImage";
+import { useAvatar } from "../../../hooks/useAvatar";
+import { useSessionAttachments } from "../../../hooks/useSessionAttachment";
+import { replaceCharacterPlaceholders } from "../utils/replaceCharacterPlaceholders";
+
+export interface VariantState {
+  total: number;
+  selectedIndex: number;
+  variants?: GroupMessageVariant[];
+}
+
+// CSS class mappings for chat appearance settings
+const FONT_SIZE_MAP = {
+  small: "text-xs",
+  medium: "text-sm",
+  large: "text-base",
+  xlarge: "text-lg",
+} as const;
+const LINE_SPACING_MAP = {
+  tight: "leading-snug",
+  normal: "leading-normal",
+  relaxed: "leading-relaxed",
+} as const;
+const BUBBLE_RADIUS_MAP = {
+  sharp: "rounded-md",
+  rounded: "rounded-lg",
+  pill: "rounded-2xl",
+} as const;
+const BUBBLE_MAX_WIDTH_MAP = {
+  compact: "max-w-[70%]",
+  normal: "max-w-[82%]",
+  wide: "max-w-[92%]",
+} as const;
+const BUBBLE_PADDING_MAP = {
+  compact: "px-3 py-1.5",
+  normal: "px-4 py-2.5",
+  spacious: "px-5 py-3.5",
+} as const;
+const BUBBLE_BLUR_MAP = {
+  none: "",
+  light: "backdrop-blur-sm",
+  medium: "backdrop-blur-md",
+  heavy: "backdrop-blur-lg",
+} as const;
+const AVATAR_SHAPE_MAP = { circle: "rounded-full", rounded: "rounded-lg", hidden: "" } as const;
+const AVATAR_SIZE_MAP = { small: "h-6 w-6", medium: "h-8 w-8", large: "h-10 w-10" } as const;
+const AVATAR_ICON_SIZE_MAP = { small: 12, medium: 16, large: 20 } as const;
+
+export interface GroupChatMessageProps {
+  message: GroupMessage;
+  index: number;
+  messagesLength: number;
+  heldMessageId: string | null;
+  regeneratingMessageId: string | null;
+  sending: boolean;
+  character?: Character;
+  persona?: Persona | null;
+  characters?: Character[];
+  theme: ThemeColors;
+  chatAppearance?: ChatAppearanceSettings;
+  getVariantState: (message: GroupMessage) => VariantState;
+  handleVariantDrag: (messageId: string, offsetX: number) => void;
+  handleRegenerate: (
+    message: GroupMessage,
+    options?: { guidance?: string; modelId?: string },
+  ) => Promise<void>;
+  models?: Model[];
+  onLongPress: (message: GroupMessage) => void;
+  displayContent?: string;
+  onImageClick?: (src: string, alt: string) => void;
+  audioStatus?: "loading" | "playing";
+  onPlayAudio?: (message: GroupMessage, text: string) => Promise<void>;
+  onStopAudio?: (message: GroupMessage) => void;
+  onCancelAudio?: (message: GroupMessage) => void;
+  reasoning?: string;
+}
+
+// Avatar component for user/assistant
+const MessageAvatar = React.memo(function MessageAvatar({
+  role,
+  character,
+  persona,
+  avatarShape = "circle",
+  avatarSize = "medium",
+}: {
+  role: "user" | "assistant" | "scene";
+  character?: Character;
+  persona?: Persona | null;
+  avatarShape?: "circle" | "rounded" | "hidden";
+  avatarSize?: "small" | "medium" | "large";
+}) {
+  const { t } = useI18n();
+  const characterAvatar = useAvatar(
+    "character",
+    character?.id ?? "",
+    character?.avatarPath,
+    "round",
+  );
+  const personaAvatar = useAvatar("persona", persona?.id ?? "", persona?.avatarPath, "round");
+
+  if (avatarShape === "hidden") return null;
+
+  const sizeClass = AVATAR_SIZE_MAP[avatarSize];
+  const shapeClass = AVATAR_SHAPE_MAP[avatarShape];
+  const iconSize = AVATAR_ICON_SIZE_MAP[avatarSize];
+
+  if (role === "user") {
+    return (
+      <div
+        className={cn(
+          "relative flex shrink-0 items-center justify-center overflow-hidden border border-fg/10 bg-linear-to-br from-fg/5 to-fg/10",
+          sizeClass,
+          shapeClass,
+        )}
+      >
+        {personaAvatar ? (
+          <AvatarImage
+            src={personaAvatar}
+            alt={t("groupChats.message.userAlt")}
+            crop={persona?.avatarCrop}
+            applyCrop
+          />
+        ) : (
+          <User size={iconSize} className="text-fg/60" />
+        )}
+      </div>
+    );
+  }
+
+  if (role === "assistant" || role === "scene") {
+    return (
+      <div
+        className={cn(
+          "relative flex shrink-0 items-center justify-center overflow-hidden border border-fg/10 bg-linear-to-br from-fg/5 to-fg/10",
+          sizeClass,
+          shapeClass,
+        )}
+      >
+        {characterAvatar ? (
+          <AvatarImage
+            src={characterAvatar}
+            alt={character?.name || t("groupChats.message.assistantAlt")}
+            crop={character?.avatarCrop}
+            applyCrop
+          />
+        ) : (
+          <Bot size={iconSize} className="text-fg/60" />
+        )}
+      </div>
+    );
+  }
+
+  return null;
+});
+
+// Memoized action buttons component
+const MessageActions = React.memo(function MessageActions({
+  disabled,
+  isRegenerating,
+  onRegenerate,
+  onGuidedRegenerate,
+  onRegenerateWithModel,
+}: {
+  disabled: boolean;
+  isRegenerating: boolean;
+  onRegenerate: () => void;
+  onGuidedRegenerate: (guidance: string) => void;
+  onRegenerateWithModel?: () => void;
+}) {
+  const { t } = useI18n();
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [guidedOpen, setGuidedOpen] = useState(false);
+  const [guidance, setGuidance] = useState("");
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const longPressTimerRef = useRef<number | null>(null);
+  const longPressTriggeredRef = useRef(false);
+
+  const clearLongPressTimer = useCallback(() => {
+    if (longPressTimerRef.current !== null) {
+      window.clearTimeout(longPressTimerRef.current);
+      longPressTimerRef.current = null;
+    }
+  }, []);
+
+  const openRegenerateMenu = useCallback(() => {
+    if (disabled) return;
+    longPressTriggeredRef.current = true;
+    if (onRegenerateWithModel) {
+      setMenuOpen(true);
+    } else {
+      setGuidedOpen(true);
+    }
+  }, [disabled, onRegenerateWithModel]);
+
+  const resetGuidedRegeneration = useCallback(() => {
+    setGuidedOpen(false);
+    setGuidance("");
+  }, []);
+
+  const handlePointerDown = useCallback(
+    (event: React.PointerEvent<HTMLButtonElement>) => {
+      if (disabled || event.button !== 0) return;
+      clearLongPressTimer();
+      longPressTriggeredRef.current = false;
+      longPressTimerRef.current = window.setTimeout(openRegenerateMenu, 450);
+    },
+    [clearLongPressTimer, disabled, openRegenerateMenu],
+  );
+
+  const handlePointerEnd = useCallback(() => {
+    clearLongPressTimer();
+  }, [clearLongPressTimer]);
+
+  const handleClick = useCallback(
+    (event: React.MouseEvent<HTMLButtonElement>) => {
+      clearLongPressTimer();
+      if (longPressTriggeredRef.current) {
+        event.preventDefault();
+        event.stopPropagation();
+        window.setTimeout(() => {
+          longPressTriggeredRef.current = false;
+        }, 0);
+        return;
+      }
+      onRegenerate();
+    },
+    [clearLongPressTimer, onRegenerate],
+  );
+
+  const handleContextMenu = useCallback(
+    (event: React.MouseEvent<HTMLButtonElement>) => {
+      if (disabled) return;
+      event.preventDefault();
+      event.stopPropagation();
+      clearLongPressTimer();
+      openRegenerateMenu();
+    },
+    [clearLongPressTimer, disabled, openRegenerateMenu],
+  );
+
+  const chooseGuidedRegeneration = useCallback(() => {
+    setMenuOpen(false);
+    setGuidedOpen(true);
+  }, []);
+
+  const chooseModelRegeneration = useCallback(() => {
+    setMenuOpen(false);
+    onRegenerateWithModel?.();
+  }, [onRegenerateWithModel]);
+
+  const submitGuidedRegeneration = useCallback(() => {
+    const trimmed = guidance.trim();
+    if (!trimmed || disabled) return;
+    resetGuidedRegeneration();
+    onGuidedRegenerate(trimmed);
+  }, [disabled, guidance, onGuidedRegenerate, resetGuidedRegeneration]);
+
+  useEffect(() => {
+    if (!guidedOpen) return;
+    const id = window.setTimeout(() => textareaRef.current?.focus(), 150);
+    return () => window.clearTimeout(id);
+  }, [guidedOpen]);
+
+  useEffect(() => clearLongPressTimer, [clearLongPressTimer]);
+
+  return (
+    <>
+      <motion.div
+        className="absolute -bottom-4 right-0 flex items-center gap-2"
+        initial={{ opacity: 0, scale: 0.9 }}
+        animate={{ opacity: 1, scale: 1 }}
+        transition={{
+          type: "tween",
+          duration: 0.15,
+          ease: [0.25, 0.46, 0.45, 0.94],
+          delay: 0.1,
+        }}
+      >
+        <button
+          type="button"
+          onPointerDown={handlePointerDown}
+          onPointerUp={handlePointerEnd}
+          onPointerLeave={handlePointerEnd}
+          onPointerCancel={handlePointerEnd}
+          onClick={handleClick}
+          onContextMenu={handleContextMenu}
+          disabled={disabled}
+          className={cn(
+            "flex items-center px-[0.6em] py-[0.3em] justify-center",
+            radius.full,
+            "border border-fg/15 bg-fg/10 text-fg",
+            interactive.transition.fast,
+            "hover:border-fg/30 hover:bg-fg/20 hover:scale-105",
+            interactive.active.scale,
+            "disabled:cursor-not-allowed disabled:opacity-80 disabled:hover:scale-100",
+          )}
+          aria-label={t("groupChats.message.regenerateResponse")}
+          style={{ willChange: "transform" }}
+        >
+          {isRegenerating ? (
+            <RefreshCw size={14} className="animate-spin rounded-full" />
+          ) : (
+            <RefreshCw size={14} />
+          )}
+        </button>
+      </motion.div>
+
+      <BottomMenu
+        isOpen={menuOpen}
+        onClose={() => setMenuOpen(false)}
+        title={t("chats.message.regenerateMenuTitle")}
+      >
+        <div className="space-y-2">
+          <button
+            type="button"
+            onClick={chooseGuidedRegeneration}
+            className="flex w-full items-center gap-3 rounded-xl border border-fg/10 bg-fg/5 px-3.5 py-3 text-left transition hover:bg-fg/10"
+          >
+            <Wand2 className="h-5 w-5 shrink-0 text-fg/40" />
+            <div className="min-w-0 flex-1">
+              <span className="block truncate text-sm text-fg">
+                {t("chats.message.regenerateWithDirection")}
+              </span>
+              <span className="block truncate text-xs text-fg/40">
+                {t("chats.message.regenerateWithDirectionDescription")}
+              </span>
+            </div>
+          </button>
+          <button
+            type="button"
+            onClick={chooseModelRegeneration}
+            className="flex w-full items-center gap-3 rounded-xl border border-fg/10 bg-fg/5 px-3.5 py-3 text-left transition hover:bg-fg/10"
+          >
+            <Cpu className="h-5 w-5 shrink-0 text-fg/40" />
+            <div className="min-w-0 flex-1">
+              <span className="block truncate text-sm text-fg">
+                {t("chats.message.regenerateWithModel")}
+              </span>
+              <span className="block truncate text-xs text-fg/40">
+                {t("chats.message.regenerateWithModelDescription")}
+              </span>
+            </div>
+          </button>
+        </div>
+      </BottomMenu>
+
+      <BottomMenu
+        isOpen={guidedOpen}
+        onClose={resetGuidedRegeneration}
+        title={t("chats.message.guidedRegenerationTitle")}
+      >
+        <form
+          className="space-y-4"
+          onSubmit={(event) => {
+            event.preventDefault();
+            submitGuidedRegeneration();
+          }}
+        >
+          <div className="space-y-1">
+            <label
+              className="block text-sm font-medium text-fg/90"
+              htmlFor="group-guided-regeneration"
+            >
+              {t("chats.message.guidedRegenerationLabel")}
+            </label>
+            <p className="text-sm leading-5 text-fg/55">
+              {t("chats.message.guidedRegenerationDescription")}
+            </p>
+          </div>
+          <textarea
+            id="group-guided-regeneration"
+            ref={textareaRef}
+            value={guidance}
+            onChange={(event) => setGuidance(event.target.value)}
+            placeholder={t("chats.message.guidedRegenerationPlaceholder")}
+            rows={4}
+            className={cn(
+              "w-full resize-none border border-fg/12 bg-fg/4 px-3 py-3 text-sm text-fg outline-none",
+              radius.lg,
+              "placeholder:text-fg/35 focus:border-fg/25 focus:bg-fg/6 focus:ring-2 focus:ring-fg/10",
+            )}
+          />
+          <div className="flex gap-3">
+            <button
+              type="button"
+              onClick={resetGuidedRegeneration}
+              className={cn(
+                "flex-1 border border-fg/10 bg-fg/5 py-3 text-sm font-medium text-fg",
+                radius.lg,
+                "transition hover:border-fg/20 hover:bg-fg/10",
+              )}
+            >
+              {t("common.buttons.cancel")}
+            </button>
+            <button
+              type="submit"
+              disabled={!guidance.trim() || disabled}
+              className={cn(
+                "flex-1 border border-emerald-500/30 bg-emerald-500/20 py-3 text-sm font-medium text-emerald-100",
+                radius.lg,
+                "transition hover:bg-emerald-500/30 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-emerald-500/20",
+              )}
+            >
+              {t("chats.message.guidedRegenerationSubmit")}
+            </button>
+          </div>
+        </form>
+      </BottomMenu>
+    </>
+  );
+});
+
+const ThinkingSection = React.memo(function ThinkingSection({
+  reasoning,
+  isStreaming,
+}: {
+  reasoning: string;
+  isStreaming: boolean;
+}) {
+  const { t } = useI18n();
+  const [isExpanded, setIsExpanded] = useState(false);
+
+  const THINKING_TEXTS = [
+    t("groupChats.message.thinkingHard"),
+    t("groupChats.message.thinkingLettuce"),
+    t("groupChats.message.thinkingVoid"),
+    t("groupChats.message.thinkingBrainCells"),
+    t("groupChats.message.thinkingForbidden"),
+    t("groupChats.message.thinkingOverthinking"),
+    t("groupChats.message.thinkingPretending"),
+    t("groupChats.message.thinkingCrunching"),
+    t("groupChats.message.thinkingArguing"),
+    t("groupChats.message.thinkingUniverse"),
+  ];
+
+  const thinkingText = React.useMemo(() => {
+    if (!isStreaming) return null;
+    return THINKING_TEXTS[Math.floor(Math.random() * THINKING_TEXTS.length)];
+  }, [isStreaming]);
+
+  if (!reasoning || reasoning.trim().length === 0) {
+    return null;
+  }
+
+  return (
+    <div className="mb-2">
+      <button
+        type="button"
+        onClick={() => setIsExpanded(!isExpanded)}
+        className={cn(
+          "flex items-center gap-2 py-1 text-left text-xs transition-colors",
+          isStreaming ? "text-fg/60 hover:text-fg/80" : "text-fg/40 hover:text-fg/60",
+        )}
+      >
+        <motion.div
+          animate={{ rotate: isExpanded ? 90 : 0 }}
+          transition={{ duration: 0.15 }}
+          className="opacity-60"
+        >
+          <ChevronDown size={12} />
+        </motion.div>
+        <span className="flex items-center gap-1.5">
+          {isStreaming && <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-fg/60" />}
+          <span className="font-medium">
+            {isStreaming ? thinkingText : t("groupChats.message.thoughtProcess")}
+          </span>
+        </span>
+      </button>
+
+      <AnimatePresence mode="wait">
+        {isExpanded && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.15 }}
+            className="overflow-hidden"
+          >
+            <div
+              className={cn(
+                "mt-1 pl-5 border-l border-fg/10",
+                "text-xs text-fg/40 italic leading-relaxed",
+                "max-h-40 overflow-y-auto",
+              )}
+            >
+              <MarkdownRenderer content={reasoning} className="text-xs text-fg/40 **:text-fg/40" />
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+});
+
+function GroupChatMessageInner({
+  message,
+  index,
+  messagesLength,
+  heldMessageId,
+  regeneratingMessageId,
+  sending,
+  character,
+  persona,
+  characters = [],
+  theme,
+  chatAppearance,
+  getVariantState,
+  handleVariantDrag,
+  handleRegenerate,
+  onLongPress,
+  displayContent,
+  onImageClick,
+  audioStatus,
+  onPlayAudio,
+  onStopAudio,
+  onCancelAudio,
+  reasoning,
+  models,
+}: GroupChatMessageProps) {
+  const { t } = useI18n();
+  const longPressTimer = useRef<number | null>(null);
+  const isLongPress = useRef(false);
+  const [modelPickerOpen, setModelPickerOpen] = useState(false);
+
+  // Memoize all computed values
+  const computed = useMemo(() => {
+    const isAssistant = message.role === "assistant";
+    const isScene = message.role === "scene";
+    const isUser = message.role === "user";
+    const isPlaceholder = message.id.startsWith("temp-") || message.id.startsWith("placeholder");
+    const actionable = (isAssistant || isUser || isScene) && !isPlaceholder;
+    const isLatestAssistant = isAssistant && actionable && index === messagesLength - 1;
+    const variantState = getVariantState(message);
+    const totalVariants = variantState.total || (isAssistant || isScene ? 1 : 0);
+    const selectedVariantIndex =
+      variantState.selectedIndex >= 0
+        ? variantState.selectedIndex
+        : totalVariants > 0
+          ? totalVariants - 1
+          : -1;
+
+    const enableSwipe = isLatestAssistant && (variantState.variants?.length ?? 0) > 1;
+
+    const showTypingIndicator = isAssistant && isPlaceholder && message.content.trim().length === 0;
+    const showRegenerateButton = isLatestAssistant && !isScene;
+    const shouldAnimate = !isPlaceholder;
+    const selectedVariant =
+      (variantState.variants?.length ?? 0) > 0 && selectedVariantIndex >= 0
+        ? variantState.variants?.[selectedVariantIndex]
+        : undefined;
+
+    return {
+      isAssistant,
+      isScene,
+      isUser,
+      isPlaceholder,
+      isLatestAssistant,
+      totalVariants,
+      selectedVariantIndex,
+      selectedVariant,
+      enableSwipe,
+      showTypingIndicator,
+      showRegenerateButton,
+      shouldAnimate,
+    };
+  }, [message.role, message.id, message.content, index, messagesLength, getVariantState]);
+
+  // Replace character placeholders in content for scene messages
+  const processedContent = useMemo(() => {
+    const content = displayContent ?? message.content;
+    if (computed.isScene && characters.length > 0) {
+      return replaceCharacterPlaceholders(content, characters);
+    }
+    return content;
+  }, [displayContent, message.content, computed.isScene, characters]);
+
+  const playText = processedContent;
+  const voiceConfig = character?.voiceConfig;
+  const hasVoiceAssignment =
+    voiceConfig?.source === "user"
+      ? !!voiceConfig.userVoiceId
+      : voiceConfig?.source === "provider"
+        ? !!voiceConfig.providerId && !!voiceConfig.voiceId
+        : false;
+  const canPlayAudio =
+    (computed.isAssistant || computed.isScene) &&
+    !computed.isPlaceholder &&
+    hasVoiceAssignment &&
+    playText.trim().length > 0;
+  const isAudioLoading = audioStatus === "loading";
+  const isAudioPlaying = audioStatus === "playing";
+
+  const handlePlayAudio = useCallback(
+    async (event: React.MouseEvent<HTMLButtonElement>) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (!canPlayAudio) return;
+      if (isAudioLoading) {
+        onCancelAudio?.(message);
+        return;
+      }
+      if (isAudioPlaying) {
+        onStopAudio?.(message);
+        return;
+      }
+      if (!onPlayAudio) return;
+      try {
+        await onPlayAudio(message, playText);
+      } catch (error) {
+        console.error("Failed to play message audio:", error);
+      }
+    },
+    [
+      canPlayAudio,
+      isAudioLoading,
+      isAudioPlaying,
+      message,
+      onCancelAudio,
+      onPlayAudio,
+      onStopAudio,
+      playText,
+    ],
+  );
+
+  const dragProps = useMemo(
+    () =>
+      computed.enableSwipe
+        ? {
+            drag: "x" as const,
+            dragConstraints: { left: -140, right: 140 },
+            dragElastic: 0.08,
+            dragMomentum: false,
+            dragSnapToOrigin: true,
+            dragTransition: { bounceStiffness: 600, bounceDamping: 40 },
+            onDragEnd: (_: unknown, info: PanInfo) =>
+              void handleVariantDrag(message.id, info.offset.x),
+            whileDrag: { scale: 0.98 },
+          }
+        : {},
+    [computed.enableSwipe, handleVariantDrag, message.id],
+  );
+
+  const animTransition = useMemo(
+    () =>
+      computed.shouldAnimate
+        ? { type: "tween" as const, duration: 0.2, ease: [0.25, 0.46, 0.45, 0.94] as const }
+        : { duration: 0 },
+    [computed.shouldAnimate],
+  );
+
+  // Long press handlers
+  const handlePointerDown = useCallback(() => {
+    isLongPress.current = false;
+    longPressTimer.current = window.setTimeout(() => {
+      isLongPress.current = true;
+      onLongPress(message);
+    }, 500);
+  }, [message, onLongPress]);
+
+  const handlePointerUp = useCallback(() => {
+    if (longPressTimer.current) {
+      clearTimeout(longPressTimer.current);
+      longPressTimer.current = null;
+    }
+  }, []);
+
+  const handlePointerLeave = useCallback(() => {
+    if (longPressTimer.current) {
+      clearTimeout(longPressTimer.current);
+      longPressTimer.current = null;
+    }
+  }, []);
+
+  const handleContextMenu = useCallback(
+    (e: React.MouseEvent) => {
+      e.preventDefault();
+      onLongPress(message);
+    },
+    [message, onLongPress],
+  );
+
+  // Event handlers for long press
+  const eventHandlers = useMemo(
+    () => ({
+      onPointerDown: handlePointerDown,
+      onPointerUp: handlePointerUp,
+      onPointerLeave: handlePointerLeave,
+      onContextMenu: handleContextMenu,
+    }),
+    [handlePointerDown, handlePointerUp, handlePointerLeave, handleContextMenu],
+  );
+
+  // Load attachments with lazy loading support for persisted images
+  const loadedAttachments = useSessionAttachments(
+    computed.selectedVariant?.attachments ?? message.attachments,
+  );
+  const bubbleStyle =
+    chatAppearance?.bubbleStyle === "minimal"
+      ? undefined
+      : message.role === "user"
+        ? {
+            backgroundColor: theme.userBgColor,
+            borderColor: theme.userBorderColor,
+          }
+        : {
+            backgroundColor: theme.assistantBgColor,
+            borderColor: theme.assistantBorderColor,
+          };
+
+  return (
+    <div
+      id={`group-msg-${message.id}`}
+      className={cn(
+        "relative flex gap-2",
+        message.role === "user" ? "justify-end" : "justify-start",
+      )}
+    >
+      {/* Avatar for assistant/scene messages (left side) */}
+      {(message.role === "assistant" || message.role === "scene") &&
+        chatAppearance?.avatarShape !== "hidden" && (
+          <div className="flex shrink-0 flex-col items-center gap-1">
+            <MessageAvatar
+              role={message.role}
+              character={character}
+              persona={persona}
+              avatarShape={chatAppearance?.avatarShape}
+              avatarSize={chatAppearance?.avatarSize}
+            />
+            {canPlayAudio && (
+              <button
+                type="button"
+                onClick={handlePlayAudio}
+                className={cn(
+                  "audio-btn flex h-6 w-6 items-center justify-center rounded-full",
+                  "border border-fg/40 bg-fg/10 text-fg shadow-sm",
+                  "transition hover:bg-fg/20 active:scale-95",
+                  "disabled:cursor-not-allowed disabled:opacity-70",
+                )}
+                aria-label={
+                  isAudioLoading
+                    ? t("groupChats.message.cancelAudioGeneration")
+                    : isAudioPlaying
+                      ? t("groupChats.message.stopAudio")
+                      : t("groupChats.message.playMessageAudio")
+                }
+                aria-pressed={isAudioPlaying}
+                aria-busy={isAudioLoading}
+                title={
+                  isAudioLoading
+                    ? t("groupChats.message.cancelAudioGeneration")
+                    : isAudioPlaying
+                      ? t("groupChats.message.stopAudio")
+                      : t("groupChats.message.playAudio")
+                }
+              >
+                {isAudioLoading ? (
+                  <Loader2 size={16} className="animate-spin" />
+                ) : isAudioPlaying ? (
+                  <Square size={14} />
+                ) : (
+                  <Volume2 size={16} />
+                )}
+              </button>
+            )}
+          </div>
+        )}
+
+      <motion.div
+        initial={computed.shouldAnimate ? { opacity: 0, y: 4 } : false}
+        animate={computed.shouldAnimate ? { opacity: 1, y: 0 } : { opacity: 1, y: 0 }}
+        transition={animTransition}
+        className={cn(
+          chatAppearance ? BUBBLE_MAX_WIDTH_MAP[chatAppearance.bubbleMaxWidth] : "max-w-[82%]",
+          chatAppearance ? BUBBLE_PADDING_MAP[chatAppearance.bubblePadding] : "px-4 py-2.5",
+          chatAppearance ? LINE_SPACING_MAP[chatAppearance.lineSpacing] : "leading-relaxed",
+          chatAppearance ? BUBBLE_RADIUS_MAP[chatAppearance.bubbleRadius] : radius.lg,
+          chatAppearance ? FONT_SIZE_MAP[chatAppearance.fontSize] : typography.body.size,
+          chatAppearance ? BUBBLE_BLUR_MAP[chatAppearance.bubbleBlur] : "",
+          message.role === "user"
+            ? cn(
+                "ml-auto",
+                chatAppearance?.bubbleStyle === "minimal"
+                  ? `${theme.userText}`
+                  : `${theme.userBg} ${theme.userText}`,
+                chatAppearance?.bubbleStyle === "bordered" && `border ${theme.userBorder}`,
+                heldMessageId === message.id && "ring-2 ring-accent/50",
+              )
+            : cn(
+                chatAppearance?.bubbleStyle === "minimal"
+                  ? `${theme.assistantText}`
+                  : `${theme.assistantBg} ${theme.assistantText}`,
+                chatAppearance?.bubbleStyle === "bordered" &&
+                  (heldMessageId === message.id
+                    ? "border border-fg/30"
+                    : `border ${theme.assistantBorder}`),
+                chatAppearance?.bubbleStyle === "filled" &&
+                  heldMessageId === message.id &&
+                  "ring-2 ring-fg/30",
+              ),
+        )}
+        style={bubbleStyle}
+        {...eventHandlers}
+        {...dragProps}
+      >
+        {/* Pin indicator */}
+        {message.isPinned && (
+          <motion.div
+            className="absolute -top-2 -right-2 z-10 flex h-5 w-5 items-center justify-center rounded-full border border-info/40 bg-info/20 shadow-lg"
+            initial={{ scale: 0, rotate: -45 }}
+            animate={{ scale: 1, rotate: 0 }}
+            transition={{ type: "spring", stiffness: 300, damping: 20 }}
+          >
+            <Pin size={12} className="text-info" />
+          </motion.div>
+        )}
+
+        {/* Thinking/Reasoning section - shown even during typing indicator */}
+        {computed.isAssistant && reasoning && (
+          <ThinkingSection reasoning={reasoning} isStreaming={computed.isPlaceholder && sending} />
+        )}
+
+        {/* Show typing indicator only if no reasoning (reasoning section has its own indicator) */}
+        {computed.showTypingIndicator && !reasoning ? (
+          <TypingIndicator />
+        ) : computed.showTypingIndicator ? null : (
+          <>
+            {/* Display attachments if present (with lazy loading support) */}
+            {loadedAttachments.length > 0 && (
+              <div className="mb-2 flex flex-wrap gap-2">
+                {loadedAttachments.map((attachment) => (
+                  <div
+                    key={attachment.id}
+                    className={cn(
+                      radius.md,
+                      "overflow-hidden border border-fg/15",
+                      attachment.data &&
+                        onImageClick &&
+                        "cursor-pointer hover:border-fg/30 transition-colors",
+                    )}
+                    onClick={() =>
+                      attachment.data &&
+                      onImageClick?.(attachment.data, attachment.filename || t("groupChats.message.attachedImage"))
+                    }
+                  >
+                    {attachment.data ? (
+                      <img
+                        src={attachment.data}
+                        alt={attachment.filename || t("groupChats.message.attachedImage")}
+                        className="max-h-48 max-w-full object-contain"
+                        style={{
+                          maxWidth:
+                            attachment.width && attachment.width > 300
+                              ? 300
+                              : attachment.width || 300,
+                        }}
+                      />
+                    ) : (
+                      // Loading placeholder
+                      <div
+                        className="flex items-center justify-center bg-fg/5"
+                        style={{
+                          width: Math.min(attachment.width || 150, 300),
+                          height: Math.min(attachment.height || 100, 192),
+                        }}
+                      >
+                        <div className="h-5 w-5 animate-spin rounded-full border-2 border-fg/20 border-t-fg/60" />
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <MarkdownRenderer
+              key={message.id + ":" + computed.selectedVariantIndex}
+              content={processedContent}
+              className="text-inherit select-none"
+              onImageClick={onImageClick}
+              textColors={
+                chatAppearance?.messageTextColorHex ||
+                chatAppearance?.plainTextColorHex ||
+                chatAppearance?.italicTextColorHex ||
+                chatAppearance?.quotedTextColorHex
+                  ? {
+                      texts: chatAppearance.messageTextColorHex ?? chatAppearance.plainTextColorHex,
+                      plain: chatAppearance.plainTextColorHex,
+                      italic: chatAppearance.italicTextColorHex,
+                      quoted: chatAppearance.quotedTextColorHex,
+                    }
+                  : undefined
+              }
+            />
+          </>
+        )}
+
+        {(computed.isAssistant || computed.isScene) && computed.totalVariants > 1 && (
+          <motion.div
+            className={cn(
+              "mt-2.5 flex items-center justify-between pr-2",
+              typography.caption.size,
+              typography.caption.weight,
+              "uppercase tracking-wider text-fg/40",
+            )}
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            transition={{ duration: 0.2, delay: 0.15 }}
+          >
+            <span className="text-fg">
+              Variant {computed.selectedVariantIndex >= 0 ? computed.selectedVariantIndex + 1 : 1}
+              {computed.totalVariants > 0 ? ` / ${computed.totalVariants}` : ""}
+            </span>
+            {regeneratingMessageId === message.id && (
+              <motion.span
+                className="flex items-center gap-1.5 text-accent/80"
+                initial={{ opacity: 0, x: 10 }}
+                animate={{ opacity: 1, x: 0 }}
+                transition={{ duration: 0.15 }}
+              >
+                <span className="h-3 w-3 animate-spin rounded-full border-2 border-accent/30 border-t-accent/80" />
+                Regenerating
+              </motion.span>
+            )}
+          </motion.div>
+        )}
+      </motion.div>
+
+      {/* Avatar for user messages (right side) */}
+      {message.role === "user" && chatAppearance?.avatarShape !== "hidden" && (
+        <MessageAvatar
+          role={message.role}
+          character={character}
+          persona={persona}
+          avatarShape={chatAppearance?.avatarShape}
+          avatarSize={chatAppearance?.avatarSize}
+        />
+      )}
+
+      {computed.showRegenerateButton && (
+        <MessageActions
+          disabled={regeneratingMessageId === message.id || sending}
+          isRegenerating={regeneratingMessageId === message.id}
+          onRegenerate={() => void handleRegenerate(message)}
+          onGuidedRegenerate={(guidance) => void handleRegenerate(message, { guidance })}
+          onRegenerateWithModel={
+            (models?.length ?? 0) > 0 ? () => setModelPickerOpen(true) : undefined
+          }
+        />
+      )}
+
+      {computed.showRegenerateButton && (models?.length ?? 0) > 0 && (
+        <ModelSelectionBottomMenu
+          isOpen={modelPickerOpen}
+          onClose={() => setModelPickerOpen(false)}
+          title={t("chats.message.regenerateModelPickerTitle")}
+          models={models ?? []}
+          selectedModelIds={message.modelId ? [message.modelId] : []}
+          onSelectModel={(modelId) => {
+            setModelPickerOpen(false);
+            void handleRegenerate(message, { modelId });
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+export const GroupChatMessage = React.memo(GroupChatMessageInner, (prev, next) => {
+  const a = prev.message;
+  const b = next.message;
+  const aAttachments = a.attachments ?? [];
+  const bAttachments = b.attachments ?? [];
+  return (
+    a.id === b.id &&
+    a.role === b.role &&
+    a.content === b.content &&
+    a.selectedVariantId === b.selectedVariantId &&
+    (a.variants?.length ?? 0) === (b.variants?.length ?? 0) &&
+    aAttachments.length === bAttachments.length &&
+    aAttachments.every((att, idx) => {
+      const other = bAttachments[idx];
+      return (
+        att.id === other?.id &&
+        att.data === other?.data &&
+        att.storagePath === other?.storagePath &&
+        att.mimeType === other?.mimeType &&
+        att.width === other?.width &&
+        att.height === other?.height
+      );
+    }) &&
+    prev.index === next.index &&
+    prev.messagesLength === next.messagesLength &&
+    prev.heldMessageId === next.heldMessageId &&
+    prev.regeneratingMessageId === next.regeneratingMessageId &&
+    prev.sending === next.sending &&
+    prev.theme === next.theme &&
+    prev.chatAppearance === next.chatAppearance &&
+    prev.character?.id === next.character?.id &&
+    prev.character?.avatarPath === next.character?.avatarPath &&
+    prev.character?.avatarCrop?.x === next.character?.avatarCrop?.x &&
+    prev.character?.avatarCrop?.y === next.character?.avatarCrop?.y &&
+    prev.character?.avatarCrop?.scale === next.character?.avatarCrop?.scale &&
+    (() => {
+      const aVoice = prev.character?.voiceConfig;
+      const bVoice = next.character?.voiceConfig;
+      if (!aVoice && !bVoice) return true;
+      if (!aVoice || !bVoice) return false;
+      return (
+        aVoice.source === bVoice.source &&
+        aVoice.userVoiceId === bVoice.userVoiceId &&
+        aVoice.providerId === bVoice.providerId &&
+        aVoice.voiceId === bVoice.voiceId &&
+        aVoice.modelId === bVoice.modelId &&
+        aVoice.voiceName === bVoice.voiceName
+      );
+    })() &&
+    prev.persona?.id === next.persona?.id &&
+    prev.persona?.avatarPath === next.persona?.avatarPath &&
+    prev.persona?.avatarCrop?.x === next.persona?.avatarCrop?.x &&
+    prev.persona?.avatarCrop?.y === next.persona?.avatarCrop?.y &&
+    prev.persona?.avatarCrop?.scale === next.persona?.avatarCrop?.scale &&
+    prev.audioStatus === next.audioStatus &&
+    a.reasoning === b.reasoning &&
+    prev.reasoning === next.reasoning &&
+    prev.models === next.models &&
+    prev.onPlayAudio === next.onPlayAudio &&
+    prev.onStopAudio === next.onStopAudio &&
+    prev.onCancelAudio === next.onCancelAudio
+  );
+});
+
+function TypingIndicator() {
+  const { t } = useI18n();
+  return (
+    <div className="flex items-center gap-1" aria-label={t("groupChats.message.assistantIsTyping")} aria-live="polite">
+      <span className="typing-dot" />
+      <span className="typing-dot" style={{ animationDelay: "0.2s" }} />
+      <span className="typing-dot" style={{ animationDelay: "0.4s" }} />
+    </div>
+  );
+}

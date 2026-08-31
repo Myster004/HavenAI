@@ -1,0 +1,20 @@
+{
+  "app": {
+    "windows": [
+      {
+        "transparent": false,
+        "decorations": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true
+      }
+    ]
+  },
+  "bundle": {
+    "resources": [
+      "./onnxruntime",
+      "./feedback_sounds/fail.mp3",
+      "./feedback_sounds/send.mp3",
+      "./feedback_sounds/success.mp3"
+    ]
+  }
+}

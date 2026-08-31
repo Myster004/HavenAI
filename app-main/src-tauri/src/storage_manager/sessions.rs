@@ -1,0 +1,4737 @@
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::de::DeserializeOwned;
+use serde::Serialize;
+use serde_json::{Map as JsonMap, Value as JsonValue};
+use std::collections::HashMap;
+use tauri::Manager;
+use uuid;
+
+use super::db::{now_ms, open_db, tracked_write, tracked_write_string};
+use crate::chat_manager::types::{
+    AdvancedModelSettings, ImageAttachment, MemoryEmbedding, MessageVariant, Session,
+    StoredMessage, UsageSummary,
+};
+use crate::dynamic_memory_run_manager::DynamicMemoryRunManager;
+use crate::embedding;
+use crate::utils::{log_error, log_info, log_warn};
+
+const ALLOWED_MEMORY_CATEGORIES: &[&str] = &[
+    "character_trait",
+    "relationship",
+    "plot_event",
+    "world_detail",
+    "preference",
+    "other",
+];
+
+fn resolved_message_effective_at(message: &JsonValue, role: &str, created_at: i64) -> Option<i64> {
+    message
+        .get("effectiveAt")
+        .and_then(JsonValue::as_i64)
+        .or_else(|| matches!(role, "user" | "assistant").then_some(created_at))
+}
+
+struct LoadedMemoryFields {
+    memories_json: String,
+    memory_embeddings: Vec<MemoryEmbedding>,
+    memory_summary: Option<String>,
+    memory_summary_token_count: i64,
+    memory_tool_events_json: String,
+    memory_status: Option<String>,
+    memory_error: Option<String>,
+    memory_progress_step: Option<i64>,
+}
+
+fn resolve_companion_state_json(
+    conn: &rusqlite::Connection,
+    character_id: &str,
+    mode: &str,
+    persona_id: Option<&str>,
+    session_value: &JsonValue,
+) -> Result<Option<String>, String> {
+    let is_companion =
+        crate::storage_manager::companion_shared_memory::character_uses_companion_mode(
+            conn,
+            character_id,
+            mode,
+        )?;
+    let state = match session_value.get("companionState") {
+        Some(v) if !v.is_null() => Some(v.clone()),
+        _ if !is_companion => None,
+        _ => {
+            let companion_json = conn
+                .query_row(
+                    "SELECT companion FROM characters WHERE id = ?1",
+                    params![character_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?
+                .flatten();
+            companion_json.and_then(|raw| {
+                crate::chat_manager::companion::initial_session_state_from_companion_json(&raw)
+            })
+        }
+    };
+    crate::storage_manager::companion_shared_memory::merge_continuity_into_state(
+        conn,
+        session_value.get("id").and_then(JsonValue::as_str),
+        character_id,
+        persona_id,
+        state,
+    )
+    .map(|state| state.and_then(|value| serde_json::to_string(&value).ok()))
+}
+
+fn hydrate_stored_companion_state(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    character_id: &str,
+    mode: &str,
+    persona_id: Option<&str>,
+    persona_disabled: bool,
+    raw_state: Option<&str>,
+) -> Result<Option<JsonValue>, String> {
+    let state = raw_state.and_then(|value| serde_json::from_str::<JsonValue>(value).ok());
+    if !crate::storage_manager::companion_shared_memory::character_uses_companion_mode(
+        conn,
+        character_id,
+        mode,
+    )? {
+        return Ok(state);
+    }
+    crate::storage_manager::companion_shared_memory::merge_continuity_into_state(
+        conn,
+        Some(session_id),
+        character_id,
+        if persona_disabled { None } else { persona_id },
+        state,
+    )
+}
+
+fn local_session_embeddings_from_legacy(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    legacy_json: &str,
+) -> Result<Vec<MemoryEmbedding>, String> {
+    let count = crate::storage_manager::memory_embeddings::count_for_session(
+        conn,
+        session_id,
+        crate::storage_manager::memory_embeddings::SessionKind::Session,
+    )
+    .unwrap_or(0);
+    if count > 0 {
+        return crate::storage_manager::memory_embeddings::load_for_session(
+            conn,
+            session_id,
+            crate::storage_manager::memory_embeddings::SessionKind::Session,
+        );
+    }
+    Ok(serde_json::from_str(legacy_json).unwrap_or_default())
+}
+
+fn load_resolved_memory_fields(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    character_id: &str,
+    mode: &str,
+    local_memories_json: &str,
+    local_memory_embeddings_json: &str,
+    local_memory_summary: Option<String>,
+    local_memory_summary_token_count: i64,
+    local_memory_tool_events_json: &str,
+    local_memory_status: Option<String>,
+    local_memory_error: Option<String>,
+    local_memory_progress_step: Option<i64>,
+) -> Result<LoadedMemoryFields, String> {
+    let owner = crate::storage_manager::companion_shared_memory::resolve_effective_memory_owner(
+        conn,
+        session_id,
+        character_id,
+        mode,
+    )?;
+
+    if !owner.shared {
+        return Ok(LoadedMemoryFields {
+            memories_json: local_memories_json.to_string(),
+            memory_embeddings: local_session_embeddings_from_legacy(
+                conn,
+                session_id,
+                local_memory_embeddings_json,
+            )?,
+            memory_summary: local_memory_summary,
+            memory_summary_token_count: local_memory_summary_token_count.max(0),
+            memory_tool_events_json: local_memory_tool_events_json.to_string(),
+            memory_status: local_memory_status,
+            memory_error: local_memory_error,
+            memory_progress_step: local_memory_progress_step,
+        });
+    }
+
+    let shared_state =
+        crate::storage_manager::companion_shared_memory::load_state(conn, character_id)?;
+    let memory_embeddings = crate::storage_manager::memory_embeddings::load_for_session(
+        conn,
+        character_id,
+        crate::storage_manager::memory_embeddings::SessionKind::CompanionShared,
+    )
+    .unwrap_or_default();
+
+    Ok(LoadedMemoryFields {
+        memories_json: shared_state.memories_json,
+        memory_embeddings,
+        memory_summary: shared_state.memory_summary,
+        memory_summary_token_count: shared_state.memory_summary_token_count.max(0),
+        memory_tool_events_json: shared_state.memory_tool_events_json,
+        memory_status: shared_state.memory_status,
+        memory_error: shared_state.memory_error,
+        memory_progress_step: shared_state.memory_progress_step,
+    })
+}
+
+/// Read the current memory embeddings for a single-character session,
+/// preferring the normalised `memory_embeddings` table when populated.
+/// Falls back to the legacy JSON column for sessions that haven't been saved
+/// under the new schema yet.
+fn read_session_embeddings_with_fallback(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> Result<Vec<MemoryEmbedding>, String> {
+    let (character_id, mode, legacy_json): (String, String, String) = conn
+        .query_row(
+            "SELECT character_id, mode, memory_embeddings FROM sessions WHERE id = ?",
+            params![session_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?
+        .unwrap_or_else(|| (String::new(), "roleplay".to_string(), "[]".to_string()));
+
+    let owner = crate::storage_manager::companion_shared_memory::resolve_effective_memory_owner(
+        conn,
+        session_id,
+        &character_id,
+        &mode,
+    )?;
+    if owner.shared {
+        return crate::storage_manager::memory_embeddings::load_for_session(
+            conn,
+            &owner.owner_id,
+            owner.kind,
+        );
+    }
+
+    local_session_embeddings_from_legacy(conn, session_id, &legacy_json)
+}
+
+fn read_session_memories_json_with_resolution(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> Result<String, String> {
+    let (character_id, mode, local_memories_json): (String, String, String) = conn
+        .query_row(
+            "SELECT character_id, mode, memories FROM sessions WHERE id = ?1",
+            params![session_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?
+        .unwrap_or_else(|| (String::new(), "roleplay".to_string(), "[]".to_string()));
+
+    let owner = crate::storage_manager::companion_shared_memory::resolve_effective_memory_owner(
+        conn,
+        session_id,
+        &character_id,
+        &mode,
+    )?;
+    if owner.shared {
+        return Ok(crate::storage_manager::companion_shared_memory::load_state(
+            conn,
+            &character_id,
+        )?
+        .memories_json);
+    }
+
+    Ok(local_memories_json)
+}
+
+/// Persist memory embeddings for a single-character session through the new
+/// table and clear the legacy JSON column. Caller is responsible for any other
+/// column updates (e.g. `updated_at`, `memories`).
+fn write_session_embeddings_through_table(
+    conn: &mut rusqlite::Connection,
+    session_id: &str,
+    embeddings: &[MemoryEmbedding],
+) -> Result<(), String> {
+    let (character_id, mode): (String, String) = conn
+        .query_row(
+            "SELECT character_id, mode FROM sessions WHERE id = ?1",
+            params![session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    let owner = crate::storage_manager::companion_shared_memory::resolve_effective_memory_owner(
+        conn,
+        session_id,
+        &character_id,
+        &mode,
+    )?;
+    crate::storage_manager::memory_embeddings::replace_all(
+        conn,
+        &owner.owner_id,
+        owner.kind,
+        embeddings,
+    )?;
+    if !owner.shared {
+        let now = now_ms() as i64;
+        conn.execute(
+            "UPDATE sessions SET memory_embeddings = '[]', updated_at = ? WHERE id = ?",
+            params![now, session_id],
+        )
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    }
+    Ok(())
+}
+
+fn write_resolved_memories_json(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    memories_json: &str,
+) -> Result<(), String> {
+    let (character_id, mode): (String, String) = conn
+        .query_row(
+            "SELECT character_id, mode FROM sessions WHERE id = ?1",
+            params![session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    let owner = crate::storage_manager::companion_shared_memory::resolve_effective_memory_owner(
+        conn,
+        session_id,
+        &character_id,
+        &mode,
+    )?;
+
+    if owner.shared {
+        let mut state =
+            crate::storage_manager::companion_shared_memory::load_state(conn, &character_id)?;
+        state.memories_json = memories_json.to_string();
+        crate::storage_manager::companion_shared_memory::upsert_state(conn, &character_id, &state)?;
+    } else {
+        let now = now_ms() as i64;
+        conn.execute(
+            "UPDATE sessions SET memories = ?, updated_at = ? WHERE id = ?",
+            params![memories_json, now, session_id],
+        )
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    }
+    Ok(())
+}
+
+fn persist_shared_memory_from_session_json(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    character_id: &str,
+    mode: &str,
+    memories_json: &str,
+    memory_embeddings_json: &str,
+    memory_summary: Option<String>,
+    memory_summary_token_count: i64,
+    memory_tool_events_json: &str,
+    memory_status: Option<String>,
+    memory_error: Option<String>,
+    memory_progress_step: Option<i64>,
+) -> Result<bool, String> {
+    let owner = crate::storage_manager::companion_shared_memory::resolve_effective_memory_owner(
+        conn,
+        session_id,
+        character_id,
+        mode,
+    )?;
+    if !owner.shared {
+        return Ok(false);
+    }
+
+    let session_exists = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+            params![session_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| crate::utils::err_to_string(module_path!(), line!(), error))?;
+    if !session_exists {
+        // New sessions attach to character-owned memory. Their empty defaults
+        // must never be interpreted as a request to clear the shared store.
+        return Ok(true);
+    }
+
+    let mut shared_state =
+        crate::storage_manager::companion_shared_memory::load_state(conn, character_id)?;
+    shared_state.memories_json = memories_json.to_string();
+    shared_state.memory_summary = memory_summary;
+    shared_state.memory_summary_token_count = memory_summary_token_count.max(0);
+    shared_state.memory_tool_events_json = memory_tool_events_json.to_string();
+    shared_state.memory_status = memory_status;
+    shared_state.memory_error = memory_error;
+    shared_state.memory_progress_step = memory_progress_step;
+    crate::storage_manager::companion_shared_memory::upsert_state(
+        conn,
+        character_id,
+        &shared_state,
+    )?;
+    crate::storage_manager::memory_embeddings::replace_all_from_json_in_transaction(
+        conn,
+        character_id,
+        crate::storage_manager::memory_embeddings::SessionKind::CompanionShared,
+        Some(memory_embeddings_json),
+    )?;
+    Ok(true)
+}
+
+fn allowed_memory_categories_for_mode(mode: &str) -> &'static [&'static str] {
+    if mode.eq_ignore_ascii_case("companion") {
+        &[
+            "character_trait",
+            "relationship",
+            "plot_event",
+            "world_detail",
+            "preference",
+            "other",
+            "milestone",
+            "boundary",
+            "profile",
+            "routine",
+            "episodic",
+            "emotional_snapshot",
+        ]
+    } else {
+        ALLOWED_MEMORY_CATEGORIES
+    }
+}
+
+/// Resolve the mode used for memory-category validation. A session may default
+/// to "roleplay" even for a companion character, so companion categories must
+/// also be allowed when the underlying character is in companion mode.
+fn resolve_memory_category_mode(conn: &rusqlite::Connection, session_id: &str) -> String {
+    let row: Option<(String, String)> = conn
+        .query_row(
+            "SELECT character_id, mode FROM sessions WHERE id = ?1",
+            params![session_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    let (character_id, session_mode) = match row {
+        Some(v) => v,
+        None => return "roleplay".to_string(),
+    };
+    if session_mode.eq_ignore_ascii_case("companion") {
+        return session_mode;
+    }
+    let character_mode: Option<String> = conn
+        .query_row(
+            "SELECT mode FROM characters WHERE id = ?1",
+            params![character_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    if character_mode
+        .as_deref()
+        .map(|m| m.eq_ignore_ascii_case("companion"))
+        .unwrap_or(false)
+    {
+        "companion".to_string()
+    } else {
+        session_mode
+    }
+}
+
+fn normalize_memory_category(
+    category: Option<String>,
+    mode: &str,
+) -> Result<Option<String>, String> {
+    let normalized = category
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty());
+    let allowed = allowed_memory_categories_for_mode(mode);
+
+    match normalized {
+        Some(value) if !allowed.contains(&value.as_str()) => Err(crate::utils::err_msg(
+            module_path!(),
+            line!(),
+            format!(
+                "Invalid memory category '{}'. Allowed values: {}",
+                value,
+                allowed.join(", ")
+            ),
+        )),
+        Some(value) => Ok(Some(value)),
+        None => Ok(None),
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionPreview {
+    id: String,
+    character_id: String,
+    title: String,
+    updated_at: i64,
+    archived: bool,
+    last_message: String,
+    message_count: i64,
+    parent_session_id: Option<String>,
+    branched_from_message_id: Option<String>,
+    root_session_id: Option<String>,
+}
+
+fn session_preview_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionPreview> {
+    Ok(SessionPreview {
+        id: r.get(0)?,
+        character_id: r.get(1)?,
+        title: r.get(2)?,
+        updated_at: r.get(3)?,
+        archived: r.get::<_, i64>(4)? != 0,
+        last_message: r.get::<_, String>(5)?,
+        message_count: r.get(6)?,
+        parent_session_id: r.get(7)?,
+        branched_from_message_id: r.get(8)?,
+        root_session_id: r.get(9)?,
+    })
+}
+
+fn json_usage_summary(
+    prompt_tokens: Option<i64>,
+    completion_tokens: Option<i64>,
+    total_tokens: Option<i64>,
+    first_token_ms: Option<i64>,
+    tokens_per_second: Option<f64>,
+    mtp_stats: Option<String>,
+) -> Option<JsonValue> {
+    let mut usage = JsonMap::new();
+    if let Some(v) = prompt_tokens {
+        usage.insert("promptTokens".into(), JsonValue::from(v));
+    }
+    if let Some(v) = completion_tokens {
+        usage.insert("completionTokens".into(), JsonValue::from(v));
+    }
+    if let Some(v) = total_tokens {
+        usage.insert("totalTokens".into(), JsonValue::from(v));
+    }
+    if let Some(v) = first_token_ms {
+        usage.insert("firstTokenMs".into(), JsonValue::from(v));
+    }
+    if let Some(v) = tokens_per_second {
+        usage.insert("tokensPerSecond".into(), JsonValue::from(v));
+    }
+    if let Some(raw) = mtp_stats {
+        if let Ok(value) = serde_json::from_str::<JsonValue>(&raw) {
+            usage.insert("mtpStats".into(), value);
+        }
+    }
+    if usage.is_empty() {
+        None
+    } else {
+        Some(JsonValue::Object(usage))
+    }
+}
+
+fn typed_usage_summary(
+    prompt_tokens: Option<i64>,
+    completion_tokens: Option<i64>,
+    total_tokens: Option<i64>,
+) -> Option<UsageSummary> {
+    if prompt_tokens.is_none() && completion_tokens.is_none() && total_tokens.is_none() {
+        return None;
+    }
+
+    Some(UsageSummary {
+        prompt_tokens: prompt_tokens.map(|value| value as u64),
+        completion_tokens: completion_tokens.map(|value| value as u64),
+        total_tokens: total_tokens.map(|value| value as u64),
+        cached_prompt_tokens: None,
+        cache_write_tokens: None,
+        reasoning_tokens: None,
+        image_tokens: None,
+        audio_tokens: None,
+        web_search_requests: None,
+        api_cost: None,
+        response_id: None,
+        first_token_ms: None,
+        tokens_per_second: None,
+        finish_reason: None,
+        mtp_stats: None,
+    })
+}
+
+fn parse_json_or_default<T>(raw: &str) -> T
+where
+    T: DeserializeOwned + Default,
+{
+    serde_json::from_str(raw).unwrap_or_default()
+}
+
+fn parse_optional_json_or_default<T>(raw: Option<&str>) -> T
+where
+    T: DeserializeOwned + Default,
+{
+    raw.and_then(|value| serde_json::from_str(value).ok())
+        .unwrap_or_default()
+}
+
+fn resolve_lorebook_ids_override_json(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    session: &JsonValue,
+) -> Result<Option<String>, String> {
+    match session.get("lorebookIdsOverride") {
+        Some(value) if value.is_null() => Ok(None),
+        Some(value) => Ok(Some(
+            serde_json::to_string(value).unwrap_or_else(|_| "[]".to_string()),
+        )),
+        None => conn
+            .query_row(
+                "SELECT lorebook_ids_override FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(|value| value.flatten())
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e)),
+    }
+}
+
+fn resolve_author_note(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    session: &JsonValue,
+) -> Result<Option<String>, String> {
+    match session.get("authorNote") {
+        Some(value) if value.is_null() => Ok(None),
+        Some(value) => Ok(value
+            .as_str()
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty())),
+        None => conn
+            .query_row(
+                "SELECT author_note FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(|value| value.flatten())
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e)),
+    }
+}
+
+fn build_session_advanced_model_settings(
+    advanced_model_settings_json: Option<&str>,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    max_output_tokens: Option<i64>,
+    frequency_penalty: Option<f64>,
+    presence_penalty: Option<f64>,
+    top_k: Option<i64>,
+) -> Option<AdvancedModelSettings> {
+    if let Some(raw) = advanced_model_settings_json {
+        if let Ok(parsed) = serde_json::from_str::<AdvancedModelSettings>(raw) {
+            return Some(parsed);
+        }
+    }
+    if temperature.is_some()
+        || top_p.is_some()
+        || max_output_tokens.is_some()
+        || frequency_penalty.is_some()
+        || presence_penalty.is_some()
+        || top_k.is_some()
+    {
+        Some(AdvancedModelSettings {
+            temperature,
+            top_p,
+            max_output_tokens: max_output_tokens.map(|value| value as u32),
+            frequency_penalty,
+            presence_penalty,
+            top_k: top_k.map(|value| value as u32),
+            ..AdvancedModelSettings::default()
+        })
+    } else {
+        None
+    }
+}
+
+fn serialize_session_advanced_model_settings(adv: Option<&JsonValue>) -> Option<String> {
+    adv.filter(|value| !value.is_null())
+        .map(|value| serde_json::to_string(value).unwrap_or_else(|_| "null".to_string()))
+}
+
+fn read_session_meta_typed_internal(
+    conn: &rusqlite::Connection,
+    id: &str,
+) -> Result<Option<Session>, String> {
+    let row = conn
+        .query_row(
+            "SELECT character_id, title, background_image_path, system_prompt, mode, selected_scene_id, persona_id, persona_disabled, voice_autoplay, temperature, top_p, max_output_tokens, frequency_penalty, presence_penalty, top_k, advanced_model_settings, companion_state, memories, memory_embeddings, memory_summary, memory_summary_token_count, memory_tool_events, memory_status, memory_error, archived, created_at, updated_at, prompt_template_id, lorebook_ids_override, memory_progress_step, author_note, parent_session_id, branched_from_message_id, root_session_id FROM sessions WHERE id = ?",
+            params![id],
+            |r| Ok((
+                r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, Option<String>>(3)?, r.get::<_, String>(4)?, r.get::<_, Option<String>>(5)?, r.get::<_, Option<String>>(6)?, r.get::<_, Option<i64>>(7)?, r.get::<_, Option<i64>>(8)?, r.get::<_, Option<f64>>(9)?, r.get::<_, Option<f64>>(10)?, r.get::<_, Option<i64>>(11)?, r.get::<_, Option<f64>>(12)?, r.get::<_, Option<f64>>(13)?, r.get::<_, Option<i64>>(14)?, r.get::<_, Option<String>>(15)?, r.get::<_, Option<String>>(16)?, r.get::<_, String>(17)?, r.get::<_, String>(18)?, r.get::<_, Option<String>>(19)?, r.get::<_, i64>(20)?, r.get::<_, String>(21)?, r.get::<_, Option<String>>(22)?, r.get::<_, Option<String>>(23)?, r.get::<_, i64>(24)?, r.get::<_, i64>(25)?, r.get::<_, i64>(26)?, r.get::<_, Option<String>>(27)?, r.get::<_, Option<String>>(28)?, r.get::<_, Option<i64>>(29)?, r.get::<_, Option<String>>(30)?, r.get::<_, Option<String>>(31)?, r.get::<_, Option<String>>(32)?, r.get::<_, Option<String>>(33)?
+            )),
+        )
+        .optional()
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    let Some((
+        character_id,
+        title,
+        background_image_path,
+        system_prompt,
+        mode,
+        selected_scene_id,
+        persona_id,
+        persona_disabled,
+        voice_autoplay,
+        temperature,
+        top_p,
+        max_output_tokens,
+        frequency_penalty,
+        presence_penalty,
+        top_k,
+        advanced_model_settings_json,
+        companion_state_json,
+        memories_json,
+        memory_embeddings_json,
+        memory_summary,
+        memory_summary_token_count,
+        memory_tool_events_json,
+        memory_status,
+        memory_error,
+        archived,
+        created_at,
+        updated_at,
+        prompt_template_id,
+        lorebook_ids_override_json,
+        memory_progress_step,
+        author_note,
+        parent_session_id,
+        branched_from_message_id,
+        root_session_id,
+    )) = row
+    else {
+        return Ok(None);
+    };
+
+    let loaded_memory = load_resolved_memory_fields(
+        conn,
+        id,
+        &character_id,
+        &mode,
+        &memories_json,
+        &memory_embeddings_json,
+        memory_summary,
+        memory_summary_token_count,
+        &memory_tool_events_json,
+        memory_status.clone(),
+        memory_error.clone(),
+        memory_progress_step,
+    )?;
+    let companion_state = hydrate_stored_companion_state(
+        conn,
+        id,
+        &character_id,
+        &mode,
+        persona_id.as_deref(),
+        persona_disabled.unwrap_or(0) != 0,
+        companion_state_json.as_deref(),
+    )?;
+
+    Ok(Some(Session {
+        id: id.to_string(),
+        character_id,
+        title,
+        parent_session_id,
+        branched_from_message_id,
+        root_session_id,
+        background_image_path,
+        system_prompt,
+        mode,
+        selected_scene_id,
+        prompt_template_id,
+        lorebook_ids_override: parse_optional_json_or_default(
+            lorebook_ids_override_json.as_deref(),
+        ),
+        author_note,
+        persona_id,
+        persona_disabled: persona_disabled.unwrap_or(0) != 0,
+        voice_autoplay: voice_autoplay.map(|value| value != 0),
+        advanced_model_settings: build_session_advanced_model_settings(
+            advanced_model_settings_json.as_deref(),
+            temperature,
+            top_p,
+            max_output_tokens,
+            frequency_penalty,
+            presence_penalty,
+            top_k,
+        ),
+        companion_state,
+        memories: parse_json_or_default(&loaded_memory.memories_json),
+        memory_embeddings: loaded_memory.memory_embeddings,
+        memory_summary: loaded_memory.memory_summary,
+        memory_summary_token_count: loaded_memory.memory_summary_token_count as u32,
+        memory_tool_events: parse_json_or_default(&loaded_memory.memory_tool_events_json),
+        memory_status: loaded_memory.memory_status,
+        memory_error: loaded_memory.memory_error,
+        memory_progress_step: loaded_memory.memory_progress_step.map(|v| v as u32),
+        messages: Vec::new(),
+        archived: archived != 0,
+        created_at: created_at as u64,
+        updated_at: updated_at as u64,
+    }))
+}
+
+fn fetch_messages_page_typed(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    limit: i64,
+    before_created_at: Option<i64>,
+    before_id: Option<&str>,
+) -> Result<Vec<StoredMessage>, String> {
+    let mut sql = String::from(
+        "SELECT id, role, content, created_at, visible_in_chat, scene_edited, prompt_tokens, completion_tokens, total_tokens, selected_variant_id, is_pinned, memory_refs, used_lorebook_entries, attachments, reasoning, first_token_ms, tokens_per_second, model_id, mtp_stats, effective_at FROM messages WHERE session_id = ?1",
+    );
+
+    let use_before = before_created_at.is_some() && before_id.is_some();
+    if use_before {
+        sql.push_str(" AND (created_at < ?2 OR (created_at = ?2 AND id < ?3))");
+    }
+    sql.push_str(" ORDER BY created_at DESC, id DESC LIMIT ");
+    sql.push_str(&limit.to_string());
+
+    type RawMessageRow = (
+        String,
+        String,
+        String,
+        i64,
+        i64,
+        i64,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+        i64,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+    );
+
+    let mut raw_messages: Vec<RawMessageRow> = Vec::new();
+    let mut message_ids: Vec<String> = Vec::new();
+    {
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+        if use_before {
+            let rows = stmt
+                .query_map(
+                    params![session_id, before_created_at.unwrap(), before_id.unwrap()],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, i64>(3)?,
+                            r.get::<_, i64>(4)?,
+                            r.get::<_, i64>(5)?,
+                            r.get::<_, Option<i64>>(6)?,
+                            r.get::<_, Option<i64>>(7)?,
+                            r.get::<_, Option<i64>>(8)?,
+                            r.get::<_, Option<String>>(9)?,
+                            r.get::<_, i64>(10)?,
+                            r.get::<_, Option<String>>(11)?,
+                            r.get::<_, Option<String>>(12)?,
+                            r.get::<_, Option<String>>(13)?,
+                            r.get::<_, Option<String>>(14)?,
+                            r.get::<_, Option<i64>>(19)?,
+                        ))
+                    },
+                )
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+            for row in rows {
+                let tuple =
+                    row.map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+                message_ids.push(tuple.0.clone());
+                raw_messages.push(tuple);
+            }
+        } else {
+            let rows = stmt
+                .query_map(params![session_id], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, i64>(4)?,
+                        r.get::<_, i64>(5)?,
+                        r.get::<_, Option<i64>>(6)?,
+                        r.get::<_, Option<i64>>(7)?,
+                        r.get::<_, Option<i64>>(8)?,
+                        r.get::<_, Option<String>>(9)?,
+                        r.get::<_, i64>(10)?,
+                        r.get::<_, Option<String>>(11)?,
+                        r.get::<_, Option<String>>(12)?,
+                        r.get::<_, Option<String>>(13)?,
+                        r.get::<_, Option<String>>(14)?,
+                        r.get::<_, Option<i64>>(19)?,
+                    ))
+                })
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+            for row in rows {
+                let tuple =
+                    row.map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+                message_ids.push(tuple.0.clone());
+                raw_messages.push(tuple);
+            }
+        }
+    }
+
+    let mut variants_by_message: HashMap<String, Vec<MessageVariant>> = HashMap::new();
+    if !message_ids.is_empty() {
+        let placeholders = message_ids
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let vsql = format!(
+            "SELECT message_id, id, content, created_at, prompt_tokens, completion_tokens, total_tokens, reasoning, first_token_ms, tokens_per_second FROM message_variants WHERE message_id IN ({}) ORDER BY created_at ASC",
+            placeholders
+        );
+        let mut vstmt = conn
+            .prepare(&vsql)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+        let vrows = vstmt
+            .query_map(rusqlite::params_from_iter(message_ids.iter()), |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, Option<i64>>(4)?,
+                    r.get::<_, Option<i64>>(5)?,
+                    r.get::<_, Option<i64>>(6)?,
+                    r.get::<_, Option<String>>(7)?,
+                ))
+            })
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+        for vr in vrows {
+            let (
+                message_id,
+                id,
+                content,
+                created_at,
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+                reasoning,
+            ) = vr.map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+            variants_by_message
+                .entry(message_id)
+                .or_default()
+                .push(MessageVariant {
+                    id,
+                    content,
+                    created_at: created_at as u64,
+                    usage: typed_usage_summary(prompt_tokens, completion_tokens, total_tokens),
+                    attachments: Vec::new(),
+                    reasoning,
+                });
+        }
+    }
+
+    let mut out: Vec<StoredMessage> = Vec::with_capacity(raw_messages.len());
+    for (
+        id,
+        role,
+        content,
+        created_at,
+        visible_in_chat,
+        scene_edited,
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+        selected_variant_id,
+        is_pinned,
+        memory_refs_json,
+        used_lorebook_entries_json,
+        attachments_json,
+        reasoning,
+        effective_at,
+    ) in raw_messages
+    {
+        out.push(StoredMessage {
+            id: id.clone(),
+            role,
+            content,
+            created_at: created_at as u64,
+            effective_at: effective_at.map(|value| value.max(0) as u64),
+            visible_in_chat: visible_in_chat != 0,
+            scene_edited: scene_edited != 0,
+            usage: typed_usage_summary(prompt_tokens, completion_tokens, total_tokens),
+            variants: variants_by_message.remove(&id).unwrap_or_default(),
+            selected_variant_id,
+            memory_refs: parse_optional_json_or_default(memory_refs_json.as_deref()),
+            used_lorebook_entries: parse_optional_json_or_default(
+                used_lorebook_entries_json.as_deref(),
+            ),
+            is_pinned: is_pinned != 0,
+            attachments: parse_optional_json_or_default::<Vec<ImageAttachment>>(
+                attachments_json.as_deref(),
+            ),
+            reasoning,
+            model_id: None,
+            gemini_content: None,
+        });
+    }
+
+    out.reverse();
+    Ok(out)
+}
+
+fn fetch_pinned_messages_typed(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> Result<Vec<StoredMessage>, String> {
+    let mut stmt = conn
+        .prepare("SELECT id FROM messages WHERE session_id = ? AND is_pinned = 1 ORDER BY created_at ASC, id ASC")
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    let rows = stmt
+        .query_map(params![session_id], |r| r.get::<_, String>(0))
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    let mut pinned_ids: Vec<String> = Vec::new();
+    for row in rows {
+        pinned_ids.push(row.map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?);
+    }
+    if pinned_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders = pinned_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT id, role, content, created_at, visible_in_chat, scene_edited, prompt_tokens, completion_tokens, total_tokens, selected_variant_id, is_pinned, memory_refs, used_lorebook_entries, attachments, reasoning, first_token_ms, tokens_per_second, model_id, effective_at FROM messages WHERE session_id = ?1 AND id IN ({}) ORDER BY created_at ASC, id ASC",
+        placeholders
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    let mut params_vec: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(1 + pinned_ids.len());
+    params_vec.push(&session_id);
+    for id in &pinned_ids {
+        params_vec.push(id);
+    }
+
+    let rows = stmt
+        .query_map(params_vec.as_slice(), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, Option<i64>>(6)?,
+                r.get::<_, Option<i64>>(7)?,
+                r.get::<_, Option<i64>>(8)?,
+                r.get::<_, Option<String>>(9)?,
+                r.get::<_, i64>(10)?,
+                r.get::<_, Option<String>>(11)?,
+                r.get::<_, Option<String>>(12)?,
+                r.get::<_, Option<String>>(13)?,
+                r.get::<_, Option<String>>(14)?,
+                r.get::<_, Option<i64>>(18)?,
+            ))
+        })
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    let mut raw_messages = Vec::new();
+    let mut message_ids = Vec::new();
+    for row in rows {
+        let tuple = row.map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+        message_ids.push(tuple.0.clone());
+        raw_messages.push(tuple);
+    }
+
+    let mut variants_by_message: HashMap<String, Vec<MessageVariant>> = HashMap::new();
+    if !message_ids.is_empty() {
+        let placeholders = message_ids
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let vsql = format!(
+            "SELECT message_id, id, content, created_at, prompt_tokens, completion_tokens, total_tokens, reasoning, first_token_ms, tokens_per_second FROM message_variants WHERE message_id IN ({}) ORDER BY created_at ASC",
+            placeholders
+        );
+        let mut vstmt = conn
+            .prepare(&vsql)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+        let rows = vstmt
+            .query_map(rusqlite::params_from_iter(message_ids.iter()), |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, Option<i64>>(4)?,
+                    r.get::<_, Option<i64>>(5)?,
+                    r.get::<_, Option<i64>>(6)?,
+                    r.get::<_, Option<String>>(7)?,
+                ))
+            })
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+        for row in rows {
+            let (
+                message_id,
+                id,
+                content,
+                created_at,
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+                reasoning,
+            ) = row.map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+            variants_by_message
+                .entry(message_id)
+                .or_default()
+                .push(MessageVariant {
+                    id,
+                    content,
+                    created_at: created_at as u64,
+                    usage: typed_usage_summary(prompt_tokens, completion_tokens, total_tokens),
+                    attachments: Vec::new(),
+                    reasoning,
+                });
+        }
+    }
+
+    let mut messages = Vec::with_capacity(raw_messages.len());
+    for (
+        id,
+        role,
+        content,
+        created_at,
+        visible_in_chat,
+        scene_edited,
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+        selected_variant_id,
+        is_pinned,
+        memory_refs_json,
+        used_lorebook_entries_json,
+        attachments_json,
+        reasoning,
+        effective_at,
+    ) in raw_messages
+    {
+        messages.push(StoredMessage {
+            id: id.clone(),
+            role,
+            content,
+            created_at: created_at as u64,
+            effective_at: effective_at.map(|value| value.max(0) as u64),
+            visible_in_chat: visible_in_chat != 0,
+            scene_edited: scene_edited != 0,
+            usage: typed_usage_summary(prompt_tokens, completion_tokens, total_tokens),
+            variants: variants_by_message.remove(&id).unwrap_or_default(),
+            selected_variant_id,
+            memory_refs: parse_optional_json_or_default(memory_refs_json.as_deref()),
+            used_lorebook_entries: parse_optional_json_or_default(
+                used_lorebook_entries_json.as_deref(),
+            ),
+            is_pinned: is_pinned != 0,
+            attachments: parse_optional_json_or_default::<Vec<ImageAttachment>>(
+                attachments_json.as_deref(),
+            ),
+            reasoning,
+            model_id: None,
+            gemini_content: None,
+        });
+    }
+
+    Ok(messages)
+}
+
+fn upsert_session_meta_value(app: &tauri::AppHandle, s: &JsonValue) -> Result<(), String> {
+    let mut conn = open_db(app)?;
+    let id = s
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "id is required".to_string())?
+        .to_string();
+    let character_id = s
+        .get("characterId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "characterId is required".to_string())?;
+    let title = s.get("title").and_then(|v| v.as_str()).unwrap_or("");
+    let parent_session_id = s
+        .get("parentSessionId")
+        .and_then(|v| v.as_str())
+        .map(|x| x.to_string());
+    let branched_from_message_id = s
+        .get("branchedFromMessageId")
+        .and_then(|v| v.as_str())
+        .map(|x| x.to_string());
+    let root_session_id = s
+        .get("rootSessionId")
+        .and_then(|v| v.as_str())
+        .map(|x| x.to_string())
+        .or_else(|| Some(id.clone()));
+    let background_image_path = s
+        .get("backgroundImagePath")
+        .and_then(|v| v.as_str())
+        .map(|x| x.to_string());
+    let system_prompt = s
+        .get("systemPrompt")
+        .and_then(|v| v.as_str())
+        .map(|x| x.to_string());
+    let mode = s
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .map(|value| value.to_string())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "roleplay".to_string());
+    let selected_scene_id = s
+        .get("selectedSceneId")
+        .and_then(|v| v.as_str())
+        .map(|x| x.to_string());
+    let prompt_template_id = s
+        .get("promptTemplateId")
+        .and_then(|v| v.as_str())
+        .map(|x| x.to_string());
+    let lorebook_ids_override_json = resolve_lorebook_ids_override_json(&conn, &id, s)?;
+    let author_note = resolve_author_note(&conn, &id, s)?;
+    let persona_id = s
+        .get("personaId")
+        .and_then(|v| v.as_str())
+        .map(|x| x.to_string());
+    let persona_disabled = s
+        .get("personaDisabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false) as i64;
+    let voice_autoplay = s
+        .get("voiceAutoplay")
+        .and_then(|v| v.as_bool())
+        .map(|value| if value { 1 } else { 0 });
+    let archived = s.get("archived").and_then(|v| v.as_bool()).unwrap_or(false) as i64;
+    let created_at = s
+        .get("createdAt")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(now_ms() as i64);
+    let updated_at = now_ms() as i64;
+
+    let memories_json = match s.get("memories") {
+        Some(v) => serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string()),
+        None => "[]".to_string(),
+    };
+    let memory_summary = s
+        .get("memorySummary")
+        .and_then(|v| v.as_str())
+        .map(|value| value.to_string());
+    let memory_summary_token_count = s
+        .get("memorySummaryTokenCount")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let memory_tool_events_json = match s.get("memoryToolEvents") {
+        Some(v) => serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string()),
+        None => "[]".to_string(),
+    };
+    let memory_embeddings_json = match s.get("memoryEmbeddings") {
+        Some(v) => serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string()),
+        None => "[]".to_string(),
+    };
+    let continuity_persona_id = if persona_disabled == 0 {
+        persona_id.as_deref()
+    } else {
+        None
+    };
+    let companion_state_json =
+        resolve_companion_state_json(&conn, &character_id, &mode, continuity_persona_id, s)?;
+    let memory_status = s
+        .get("memoryStatus")
+        .and_then(|v| v.as_str())
+        .map(|value| value.to_string());
+    let memory_error = s
+        .get("memoryError")
+        .and_then(|v| v.as_str())
+        .map(|value| value.to_string());
+    let memory_progress_step = s.get("memoryProgressStep").and_then(|v| v.as_i64());
+    let shared_memory_enabled = persist_shared_memory_from_session_json(
+        &mut conn,
+        &id,
+        &character_id,
+        &mode,
+        &memories_json,
+        &memory_embeddings_json,
+        memory_summary.clone(),
+        memory_summary_token_count,
+        &memory_tool_events_json,
+        memory_status.clone(),
+        memory_error.clone(),
+        memory_progress_step,
+    )?;
+    let session_memories_json = if shared_memory_enabled {
+        "[]".to_string()
+    } else {
+        memories_json.clone()
+    };
+    let session_memory_embeddings_json = if shared_memory_enabled {
+        "[]".to_string()
+    } else {
+        memory_embeddings_json.clone()
+    };
+    let session_memory_summary = if shared_memory_enabled {
+        None
+    } else {
+        memory_summary.clone()
+    };
+    let session_memory_summary_token_count = if shared_memory_enabled {
+        0
+    } else {
+        memory_summary_token_count
+    };
+    let session_memory_tool_events_json = if shared_memory_enabled {
+        "[]".to_string()
+    } else {
+        memory_tool_events_json.clone()
+    };
+    let session_memory_status = if shared_memory_enabled {
+        None
+    } else {
+        memory_status.clone()
+    };
+    let session_memory_error = if shared_memory_enabled {
+        None
+    } else {
+        memory_error.clone()
+    };
+    let session_memory_progress_step = if shared_memory_enabled {
+        None
+    } else {
+        memory_progress_step
+    };
+
+    let adv = s.get("advancedModelSettings");
+    let advanced_model_settings_json = serialize_session_advanced_model_settings(adv);
+    let temperature = adv
+        .and_then(|v| v.get("temperature"))
+        .and_then(|v| v.as_f64());
+    let top_p = adv.and_then(|v| v.get("topP")).and_then(|v| v.as_f64());
+    let max_output_tokens = adv
+        .and_then(|v| v.get("maxOutputTokens"))
+        .and_then(|v| v.as_i64());
+    let frequency_penalty = adv
+        .and_then(|v| v.get("frequencyPenalty"))
+        .and_then(|v| v.as_f64());
+    let presence_penalty = adv
+        .and_then(|v| v.get("presencePenalty"))
+        .and_then(|v| v.as_f64());
+    let top_k = adv.and_then(|v| v.get("topK")).and_then(|v| v.as_i64());
+
+    tracked_write_string(&conn, |tx| {
+        if let Some(companion_state) = companion_state_json
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<JsonValue>(value).ok())
+        {
+            crate::storage_manager::companion_shared_memory::persist_continuity_from_state(
+                tx,
+                Some(&id),
+                &character_id,
+                continuity_persona_id,
+                &companion_state,
+            )?;
+        }
+
+        tx.execute(
+        r#"INSERT INTO sessions (id, character_id, title, parent_session_id, branched_from_message_id, root_session_id, background_image_path, system_prompt, mode, selected_scene_id, prompt_template_id, lorebook_ids_override, author_note, persona_id, persona_disabled, voice_autoplay, temperature, top_p, max_output_tokens, frequency_penalty, presence_penalty, top_k, advanced_model_settings, companion_state, memories, memory_embeddings, memory_summary, memory_summary_token_count, memory_tool_events, memory_status, memory_error, memory_progress_step, archived, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              character_id=excluded.character_id,
+              title=excluded.title,
+              parent_session_id=excluded.parent_session_id,
+              branched_from_message_id=excluded.branched_from_message_id,
+              root_session_id=excluded.root_session_id,
+              background_image_path=excluded.background_image_path,
+              system_prompt=excluded.system_prompt,
+              mode=excluded.mode,
+              selected_scene_id=excluded.selected_scene_id,
+              prompt_template_id=excluded.prompt_template_id,
+              lorebook_ids_override=excluded.lorebook_ids_override,
+              author_note=excluded.author_note,
+              persona_id=excluded.persona_id,
+              persona_disabled=excluded.persona_disabled,
+              voice_autoplay=excluded.voice_autoplay,
+              temperature=excluded.temperature,
+              top_p=excluded.top_p,
+              max_output_tokens=excluded.max_output_tokens,
+              frequency_penalty=excluded.frequency_penalty,
+              presence_penalty=excluded.presence_penalty,
+              top_k=excluded.top_k,
+              advanced_model_settings=excluded.advanced_model_settings,
+              companion_state=excluded.companion_state,
+              memories=excluded.memories,
+              memory_embeddings=excluded.memory_embeddings,
+              memory_summary=excluded.memory_summary,
+              memory_summary_token_count=excluded.memory_summary_token_count,
+              memory_tool_events=excluded.memory_tool_events,
+              memory_status=excluded.memory_status,
+              memory_error=excluded.memory_error,
+              memory_progress_step=excluded.memory_progress_step,
+              archived=excluded.archived,
+              updated_at=excluded.updated_at"#,
+        params![
+            &id,
+            character_id,
+            title,
+            parent_session_id,
+            branched_from_message_id,
+            root_session_id,
+            background_image_path,
+            system_prompt,
+            mode,
+            selected_scene_id,
+            prompt_template_id,
+            lorebook_ids_override_json,
+            author_note,
+            persona_id,
+            persona_disabled,
+            voice_autoplay,
+            temperature,
+            top_p,
+            max_output_tokens,
+            frequency_penalty,
+            presence_penalty,
+            top_k,
+            advanced_model_settings_json,
+            companion_state_json,
+            &session_memories_json,
+            &session_memory_embeddings_json,
+            session_memory_summary,
+            session_memory_summary_token_count,
+            &session_memory_tool_events_json,
+            session_memory_status,
+            session_memory_error,
+            session_memory_progress_step,
+            archived,
+            created_at,
+            updated_at
+        ],
+        )
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+        Ok(())
+    })?;
+
+    Ok(())
+}
+
+fn upsert_messages_batch_value(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    msgs: &[JsonValue],
+) -> Result<(), String> {
+    let conn = open_db(app)?;
+
+    log_info(
+        app,
+        "messages_upsert_batch",
+        format!(
+            "Upserting {} messages for session {}",
+            msgs.len(),
+            session_id
+        ),
+    );
+
+    let now = now_ms() as i64;
+    tracked_write_string(&conn, |tx| {
+        for m in msgs {
+            let mid = m
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .ok_or_else(|| "message.id is required".to_string())?;
+            let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+            let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            let mcreated = m.get("createdAt").and_then(|v| v.as_i64()).unwrap_or(now);
+            let is_pinned = m.get("isPinned").and_then(|v| v.as_bool()).unwrap_or(false) as i64;
+            let visible_in_chat = m
+                .get("visibleInChat")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false) as i64;
+            let scene_edited = m
+                .get("sceneEdited")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false) as i64;
+            let usage = m.get("usage");
+            let pt = usage
+                .and_then(|u| u.get("promptTokens"))
+                .and_then(|v| v.as_i64());
+            let ct = usage
+                .and_then(|u| u.get("completionTokens"))
+                .and_then(|v| v.as_i64());
+            let tt = usage
+                .and_then(|u| u.get("totalTokens"))
+                .and_then(|v| v.as_i64());
+            let selected_variant_id = m
+                .get("selectedVariantId")
+                .and_then(|v| v.as_str())
+                .map(|x| x.to_string());
+            let memory_refs = m
+                .get("memoryRefs")
+                .cloned()
+                .unwrap_or_else(|| JsonValue::Array(Vec::new()));
+            let used_lorebook_entries = m
+                .get("usedLorebookEntries")
+                .cloned()
+                .unwrap_or_else(|| JsonValue::Array(Vec::new()));
+            let attachments = m
+                .get("attachments")
+                .cloned()
+                .unwrap_or_else(|| JsonValue::Array(Vec::new()));
+            let reasoning = m
+                .get("reasoning")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            tx.execute(
+            r#"INSERT INTO messages (id, session_id, role, content, created_at, effective_at, visible_in_chat, scene_edited, prompt_tokens, completion_tokens, total_tokens, selected_variant_id, is_pinned, memory_refs, used_lorebook_entries, attachments, reasoning, first_token_ms, tokens_per_second, model_id, mtp_stats)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                 session_id=excluded.session_id,
+                 role=excluded.role,
+                 content=excluded.content,
+                 created_at=excluded.created_at,
+                 effective_at=COALESCE(messages.effective_at, excluded.effective_at),
+                 visible_in_chat=excluded.visible_in_chat,
+                 scene_edited=excluded.scene_edited,
+                 prompt_tokens=excluded.prompt_tokens,
+                 completion_tokens=excluded.completion_tokens,
+                 total_tokens=excluded.total_tokens,
+                 selected_variant_id=excluded.selected_variant_id,
+                 is_pinned=excluded.is_pinned,
+                 memory_refs=excluded.memory_refs,
+                 used_lorebook_entries=excluded.used_lorebook_entries,
+                 attachments=excluded.attachments,
+                 reasoning=excluded.reasoning, first_token_ms=excluded.first_token_ms, tokens_per_second=excluded.tokens_per_second, model_id=excluded.model_id, mtp_stats=excluded.mtp_stats"#,
+            params![
+                &mid,
+                session_id,
+                role,
+                content,
+                mcreated,
+                resolved_message_effective_at(m, role, mcreated),
+                visible_in_chat,
+                scene_edited,
+                pt,
+                ct,
+                tt,
+                selected_variant_id,
+                is_pinned,
+                memory_refs.to_string(),
+                used_lorebook_entries.to_string(),
+                attachments.to_string(),
+                reasoning,
+                usage.and_then(|u| u.get("firstTokenMs")).and_then(|v| v.as_i64()),
+                usage.and_then(|u| u.get("tokensPerSecond")).and_then(|v| v.as_f64()),
+                m.get("modelId").and_then(|v| v.as_str()),
+                usage.and_then(|u| u.get("mtpStats")).map(|v| v.to_string())
+            ],
+        )
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+            if m.get("variants").is_some() {
+                tx.execute(
+                    "DELETE FROM message_variants WHERE message_id = ?",
+                    params![&mid],
+                )
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+                if let Some(vars) = m.get("variants").and_then(|v| v.as_array()) {
+                    for v in vars {
+                        let vid = v
+                            .get("id")
+                            .and_then(|x| x.as_str())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                        let vcontent = v.get("content").and_then(|x| x.as_str()).unwrap_or("");
+                        let vcreated = v.get("createdAt").and_then(|x| x.as_i64()).unwrap_or(now);
+                        let u = v.get("usage");
+                        let vp = u
+                            .and_then(|u| u.get("promptTokens"))
+                            .and_then(|v| v.as_i64());
+                        let vc = u
+                            .and_then(|u| u.get("completionTokens"))
+                            .and_then(|v| v.as_i64());
+                        let vt = u
+                            .and_then(|u| u.get("totalTokens"))
+                            .and_then(|v| v.as_i64());
+                        let vreasoning = v
+                            .get("reasoning")
+                            .and_then(|x| x.as_str())
+                            .map(|s| s.to_string());
+                        tx.execute(
+                        "INSERT INTO message_variants (id, message_id, content, created_at, prompt_tokens, completion_tokens, total_tokens, reasoning, first_token_ms, tokens_per_second, mtp_stats) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        params![vid, &mid, vcontent, vcreated, vp, vc, vt, vreasoning, u.and_then(|u| u.get("firstTokenMs")).and_then(|v| v.as_i64()), u.and_then(|u| u.get("tokensPerSecond")).and_then(|v| v.as_f64()), u.and_then(|u| u.get("mtpStats")).map(|v| v.to_string())],
+                    )
+                    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+                    }
+                }
+            }
+        }
+
+        tx.execute(
+            "UPDATE sessions SET updated_at = ? WHERE id = ?",
+            params![now, session_id],
+        )
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+        Ok(())
+    })
+}
+
+pub fn session_get_meta_internal(
+    app: &tauri::AppHandle,
+    id: &str,
+) -> Result<Option<Session>, String> {
+    let conn = open_db(app)?;
+    read_session_meta_typed_internal(&conn, id)
+}
+
+pub fn messages_list_internal(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    limit: i64,
+    before_created_at: Option<i64>,
+    before_id: Option<&str>,
+) -> Result<Vec<StoredMessage>, String> {
+    let conn = open_db(app)?;
+    fetch_messages_page_typed(&conn, session_id, limit, before_created_at, before_id)
+}
+
+pub fn messages_list_pinned_internal(
+    app: &tauri::AppHandle,
+    session_id: &str,
+) -> Result<Vec<StoredMessage>, String> {
+    let conn = open_db(app)?;
+    fetch_pinned_messages_typed(&conn, session_id)
+}
+
+pub fn session_upsert_meta_internal(
+    app: &tauri::AppHandle,
+    session: &Session,
+) -> Result<(), String> {
+    let value = serde_json::to_value(session)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    upsert_session_meta_value(app, &value)
+}
+
+pub fn messages_upsert_batch_internal(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    messages: &[StoredMessage],
+) -> Result<(), String> {
+    let value = serde_json::to_value(messages)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    let Some(items) = value.as_array() else {
+        return Err(crate::utils::err_msg(
+            module_path!(),
+            line!(),
+            "messages must serialize to a JSON array",
+        ));
+    };
+    upsert_messages_batch_value(app, session_id, items)
+}
+
+fn read_session_meta(conn: &rusqlite::Connection, id: &str) -> Result<Option<JsonValue>, String> {
+    let row = conn
+        .query_row(
+            "SELECT character_id, title, background_image_path, system_prompt, mode, selected_scene_id, persona_id, persona_disabled, voice_autoplay, temperature, top_p, max_output_tokens, frequency_penalty, presence_penalty, top_k, advanced_model_settings, companion_state, memories, memory_embeddings, memory_summary, memory_summary_token_count, memory_tool_events, memory_status, memory_error, archived, created_at, updated_at, prompt_template_id, lorebook_ids_override, memory_progress_step, author_note, parent_session_id, branched_from_message_id, root_session_id FROM sessions WHERE id = ?",
+            params![id],
+            |r| Ok((
+                r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, Option<String>>(3)?, r.get::<_, String>(4)?, r.get::<_, Option<String>>(5)?, r.get::<_, Option<String>>(6)?, r.get::<_, Option<i64>>(7)?, r.get::<_, Option<i64>>(8)?, r.get::<_, Option<f64>>(9)?, r.get::<_, Option<f64>>(10)?, r.get::<_, Option<i64>>(11)?, r.get::<_, Option<f64>>(12)?, r.get::<_, Option<f64>>(13)?, r.get::<_, Option<i64>>(14)?, r.get::<_, Option<String>>(15)?, r.get::<_, Option<String>>(16)?, r.get::<_, String>(17)?, r.get::<_, String>(18)?, r.get::<_, Option<String>>(19)?, r.get::<_, i64>(20)?, r.get::<_, String>(21)?, r.get::<_, Option<String>>(22)?, r.get::<_, Option<String>>(23)?, r.get::<_, i64>(24)?, r.get::<_, i64>(25)?, r.get::<_, i64>(26)?, r.get::<_, Option<String>>(27)?, r.get::<_, Option<String>>(28)?, r.get::<_, Option<i64>>(29)?, r.get::<_, Option<String>>(30)?, r.get::<_, Option<String>>(31)?, r.get::<_, Option<String>>(32)?, r.get::<_, Option<String>>(33)?
+            )),
+        )
+        .optional()
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    let Some((
+        character_id,
+        title,
+        background_image_path,
+        system_prompt,
+        mode,
+        selected_scene_id,
+        persona_id,
+        persona_disabled,
+        voice_autoplay,
+        temperature,
+        top_p,
+        max_output_tokens,
+        frequency_penalty,
+        presence_penalty,
+        top_k,
+        advanced_model_settings_json,
+        companion_state_json,
+        memories_json,
+        memory_embeddings_json,
+        memory_summary,
+        memory_summary_token_count,
+        memory_tool_events_json,
+        memory_status,
+        memory_error,
+        archived,
+        created_at,
+        updated_at,
+        prompt_template_id,
+        lorebook_ids_override_json,
+        memory_progress_step,
+        author_note,
+        parent_session_id,
+        branched_from_message_id,
+        root_session_id,
+    )) = row
+    else {
+        return Ok(None);
+    };
+
+    let advanced = build_session_advanced_model_settings(
+        advanced_model_settings_json.as_deref(),
+        temperature,
+        top_p,
+        max_output_tokens,
+        frequency_penalty,
+        presence_penalty,
+        top_k,
+    )
+    .and_then(|value| serde_json::to_value(value).ok());
+
+    let loaded_memory = load_resolved_memory_fields(
+        conn,
+        id,
+        &character_id,
+        &mode,
+        &memories_json,
+        &memory_embeddings_json,
+        memory_summary,
+        memory_summary_token_count,
+        &memory_tool_events_json,
+        memory_status.clone(),
+        memory_error.clone(),
+        memory_progress_step,
+    )?;
+
+    let memories: JsonValue = serde_json::from_str(&loaded_memory.memories_json)
+        .unwrap_or_else(|_| JsonValue::Array(vec![]));
+    let memory_embeddings = serde_json::to_value(loaded_memory.memory_embeddings)
+        .unwrap_or_else(|_| JsonValue::Array(vec![]));
+    let memory_tool_events: JsonValue =
+        serde_json::from_str(&loaded_memory.memory_tool_events_json)
+            .unwrap_or_else(|_| JsonValue::Array(vec![]));
+    let companion_state = hydrate_stored_companion_state(
+        conn,
+        id,
+        &character_id,
+        &mode,
+        persona_id.as_deref(),
+        persona_disabled.unwrap_or(0) != 0,
+        companion_state_json.as_deref(),
+    )?;
+
+    let session = serde_json::json!({
+        "id": id,
+        "characterId": character_id,
+        "title": title,
+        "parentSessionId": parent_session_id,
+        "branchedFromMessageId": branched_from_message_id,
+        "rootSessionId": root_session_id,
+        "backgroundImagePath": background_image_path,
+        "systemPrompt": system_prompt,
+        "mode": mode,
+        "selectedSceneId": selected_scene_id,
+        "promptTemplateId": prompt_template_id,
+        "lorebookIdsOverride": lorebook_ids_override_json.as_deref().and_then(|value| serde_json::from_str::<JsonValue>(value).ok()),
+        "authorNote": author_note,
+        "personaId": persona_id,
+        "personaDisabled": persona_disabled.unwrap_or(0) != 0,
+        "voiceAutoplay": voice_autoplay.map(|value| value != 0),
+        "advancedModelSettings": advanced,
+        "companionState": companion_state,
+        "memories": memories,
+        "memoryEmbeddings": memory_embeddings,
+        "memorySummary": loaded_memory.memory_summary.unwrap_or_default(),
+        "memorySummaryTokenCount": loaded_memory.memory_summary_token_count,
+        "memoryToolEvents": memory_tool_events,
+        "memoryStatus": loaded_memory.memory_status,
+        "memoryError": loaded_memory.memory_error,
+        "memoryProgressStep": loaded_memory.memory_progress_step,
+        "messages": [],
+        "archived": archived != 0,
+        "createdAt": created_at,
+        "updatedAt": updated_at,
+    });
+    Ok(Some(session))
+}
+
+fn read_session(conn: &rusqlite::Connection, id: &str) -> Result<Option<JsonValue>, String> {
+    let row = conn
+        .query_row(
+            "SELECT character_id, title, background_image_path, system_prompt, mode, selected_scene_id, persona_id, persona_disabled, voice_autoplay, temperature, top_p, max_output_tokens, frequency_penalty, presence_penalty, top_k, advanced_model_settings, companion_state, memories, memory_embeddings, memory_summary, memory_summary_token_count, memory_tool_events, memory_status, memory_error, archived, created_at, updated_at, prompt_template_id, lorebook_ids_override, memory_progress_step, author_note, parent_session_id, branched_from_message_id, root_session_id FROM sessions WHERE id = ?",
+            params![id],
+            |r| Ok((
+                r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, Option<String>>(3)?, r.get::<_, String>(4)?, r.get::<_, Option<String>>(5)?, r.get::<_, Option<String>>(6)?, r.get::<_, Option<i64>>(7)?, r.get::<_, Option<i64>>(8)?, r.get::<_, Option<f64>>(9)?, r.get::<_, Option<f64>>(10)?, r.get::<_, Option<i64>>(11)?, r.get::<_, Option<f64>>(12)?, r.get::<_, Option<f64>>(13)?, r.get::<_, Option<i64>>(14)?, r.get::<_, Option<String>>(15)?, r.get::<_, Option<String>>(16)?, r.get::<_, String>(17)?, r.get::<_, String>(18)?, r.get::<_, Option<String>>(19)?, r.get::<_, i64>(20)?, r.get::<_, String>(21)?, r.get::<_, Option<String>>(22)?, r.get::<_, Option<String>>(23)?, r.get::<_, i64>(24)?, r.get::<_, i64>(25)?, r.get::<_, i64>(26)?, r.get::<_, Option<String>>(27)?, r.get::<_, Option<String>>(28)?, r.get::<_, Option<i64>>(29)?, r.get::<_, Option<String>>(30)?, r.get::<_, Option<String>>(31)?, r.get::<_, Option<String>>(32)?, r.get::<_, Option<String>>(33)?
+            )),
+        )
+        .optional()
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    let Some((
+        character_id,
+        title,
+        background_image_path,
+        system_prompt,
+        mode,
+        selected_scene_id,
+        persona_id,
+        persona_disabled,
+        voice_autoplay,
+        temperature,
+        top_p,
+        max_output_tokens,
+        frequency_penalty,
+        presence_penalty,
+        top_k,
+        advanced_model_settings_json,
+        companion_state_json,
+        memories_json,
+        memory_embeddings_json,
+        memory_summary,
+        memory_summary_token_count,
+        memory_tool_events_json,
+        memory_status,
+        memory_error,
+        archived,
+        created_at,
+        updated_at,
+        prompt_template_id,
+        lorebook_ids_override_json,
+        memory_progress_step,
+        author_note,
+        parent_session_id,
+        branched_from_message_id,
+        root_session_id,
+    )) = row
+    else {
+        return Ok(None);
+    };
+
+    // messages
+    let mut mstmt = conn.prepare("SELECT id, role, content, created_at, visible_in_chat, scene_edited, prompt_tokens, completion_tokens, total_tokens, selected_variant_id, is_pinned, memory_refs, used_lorebook_entries, attachments, reasoning, first_token_ms, tokens_per_second, model_id, mtp_stats, effective_at FROM messages WHERE session_id = ? ORDER BY created_at ASC").map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    let mrows = mstmt
+        .query_map(params![id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, Option<i64>>(6)?,
+                r.get::<_, Option<i64>>(7)?,
+                r.get::<_, Option<i64>>(8)?,
+                r.get::<_, Option<String>>(9)?,
+                r.get::<_, i64>(10)?,
+                r.get::<_, Option<String>>(11)?,
+                r.get::<_, Option<String>>(12)?,
+                r.get::<_, Option<String>>(13)?,
+                r.get::<_, Option<String>>(14)?,
+                r.get::<_, Option<i64>>(15)?,
+                r.get::<_, Option<f64>>(16)?,
+                r.get::<_, Option<String>>(17)?,
+                r.get::<_, Option<String>>(18)?,
+                r.get::<_, Option<i64>>(19)?,
+            ))
+        })
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    let mut messages: Vec<JsonValue> = Vec::new();
+    for mr in mrows {
+        let (
+            mid,
+            role,
+            content,
+            mcreated,
+            visible_in_chat,
+            scene_edited,
+            p_tokens,
+            c_tokens,
+            t_tokens,
+            selected_variant_id,
+            is_pinned,
+            memory_refs_json,
+            used_lorebook_entries_json,
+            attachments_json,
+            reasoning,
+            first_token_ms,
+            tokens_per_second,
+            model_id,
+            mtp_stats,
+            effective_at,
+        ) = mr.map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+        let mut vstmt = conn.prepare("SELECT id, content, created_at, prompt_tokens, completion_tokens, total_tokens, reasoning, first_token_ms, tokens_per_second, mtp_stats FROM message_variants WHERE message_id = ? ORDER BY created_at ASC").map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+        let vrows = vstmt
+            .query_map(params![&mid], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
+                    r.get::<_, Option<i64>>(4)?,
+                    r.get::<_, Option<i64>>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                    r.get::<_, Option<i64>>(7)?,
+                    r.get::<_, Option<f64>>(8)?,
+                    r.get::<_, Option<String>>(9)?,
+                ))
+            })
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+        let mut variants: Vec<JsonValue> = Vec::new();
+        for vr in vrows {
+            let (vid, vcontent, vcreated, vp, vc, vt, vreasoning, vftm, vtps, vmtp) =
+                vr.map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+            let mut vobj = JsonMap::new();
+            vobj.insert("id".into(), JsonValue::String(vid));
+            vobj.insert("content".into(), JsonValue::String(vcontent));
+            vobj.insert("createdAt".into(), JsonValue::from(vcreated));
+            if let Some(usage) = json_usage_summary(vp, vc, vt, vftm, vtps, vmtp) {
+                vobj.insert("usage".into(), usage);
+            }
+            if let Some(r) = vreasoning {
+                vobj.insert("reasoning".into(), JsonValue::String(r));
+            }
+            variants.push(JsonValue::Object(vobj));
+        }
+        let mut mobj = JsonMap::new();
+        mobj.insert("id".into(), JsonValue::String(mid));
+        mobj.insert("role".into(), JsonValue::String(role));
+        mobj.insert("content".into(), JsonValue::String(content));
+        mobj.insert("createdAt".into(), JsonValue::from(mcreated));
+        if let Some(effective_at) = effective_at {
+            mobj.insert("effectiveAt".into(), JsonValue::from(effective_at));
+        }
+        if let Some(model_id_val) = model_id {
+            mobj.insert("modelId".into(), JsonValue::String(model_id_val));
+        }
+        if visible_in_chat != 0 {
+            mobj.insert("visibleInChat".into(), JsonValue::Bool(true));
+        }
+        if scene_edited != 0 {
+            mobj.insert("sceneEdited".into(), JsonValue::Bool(true));
+        }
+        if let Some(usage) = json_usage_summary(
+            p_tokens,
+            c_tokens,
+            t_tokens,
+            first_token_ms,
+            tokens_per_second,
+            mtp_stats,
+        ) {
+            mobj.insert("usage".into(), usage);
+        }
+        if !variants.is_empty() {
+            mobj.insert("variants".into(), JsonValue::Array(variants));
+        }
+        if let Some(sel) = selected_variant_id {
+            mobj.insert("selectedVariantId".into(), JsonValue::String(sel));
+        }
+        mobj.insert("isPinned".into(), JsonValue::Bool(is_pinned != 0));
+        if let Some(refs_json) = memory_refs_json {
+            if let Ok(parsed) = serde_json::from_str::<JsonValue>(&refs_json) {
+                mobj.insert("memoryRefs".into(), parsed);
+            }
+        }
+        if let Some(lorebook_json) = used_lorebook_entries_json {
+            if let Ok(parsed) = serde_json::from_str::<JsonValue>(&lorebook_json) {
+                mobj.insert("usedLorebookEntries".into(), parsed);
+            }
+        }
+        // Parse and insert attachments
+        if let Some(att_json) = attachments_json {
+            if let Ok(parsed) = serde_json::from_str::<JsonValue>(&att_json) {
+                mobj.insert("attachments".into(), parsed);
+            }
+        }
+        // Add reasoning if present
+        if let Some(r) = reasoning {
+            mobj.insert("reasoning".into(), JsonValue::String(r));
+        }
+        messages.push(JsonValue::Object(mobj));
+    }
+
+    let advanced = build_session_advanced_model_settings(
+        advanced_model_settings_json.as_deref(),
+        temperature,
+        top_p,
+        max_output_tokens,
+        frequency_penalty,
+        presence_penalty,
+        top_k,
+    )
+    .and_then(|value| serde_json::to_value(value).ok());
+
+    let loaded_memory = load_resolved_memory_fields(
+        conn,
+        id,
+        &character_id,
+        &mode,
+        &memories_json,
+        &memory_embeddings_json,
+        memory_summary,
+        memory_summary_token_count,
+        &memory_tool_events_json,
+        memory_status.clone(),
+        memory_error.clone(),
+        memory_progress_step,
+    )?;
+
+    let memories: JsonValue = serde_json::from_str(&loaded_memory.memories_json)
+        .unwrap_or_else(|_| JsonValue::Array(vec![]));
+    let memory_embeddings = serde_json::to_value(loaded_memory.memory_embeddings)
+        .unwrap_or_else(|_| JsonValue::Array(vec![]));
+    let memory_tool_events: JsonValue =
+        serde_json::from_str(&loaded_memory.memory_tool_events_json)
+            .unwrap_or_else(|_| JsonValue::Array(vec![]));
+    let companion_state = hydrate_stored_companion_state(
+        conn,
+        id,
+        &character_id,
+        &mode,
+        persona_id.as_deref(),
+        persona_disabled.unwrap_or(0) != 0,
+        companion_state_json.as_deref(),
+    )?;
+
+    let session = serde_json::json!({
+        "id": id,
+        "characterId": character_id,
+        "title": title,
+        "parentSessionId": parent_session_id,
+        "branchedFromMessageId": branched_from_message_id,
+        "rootSessionId": root_session_id,
+        "backgroundImagePath": background_image_path,
+        "systemPrompt": system_prompt,
+        "mode": mode,
+        "selectedSceneId": selected_scene_id,
+        "promptTemplateId": prompt_template_id,
+        "lorebookIdsOverride": lorebook_ids_override_json.as_deref().and_then(|value| serde_json::from_str::<JsonValue>(value).ok()),
+        "authorNote": author_note,
+        "personaId": persona_id,
+        "personaDisabled": persona_disabled.unwrap_or(0) != 0,
+        "voiceAutoplay": voice_autoplay.map(|value| value != 0),
+        "advancedModelSettings": advanced,
+        "companionState": companion_state,
+        "memories": memories,
+        "memoryEmbeddings": memory_embeddings,
+        "memorySummary": loaded_memory.memory_summary.unwrap_or_default(),
+        "memorySummaryTokenCount": loaded_memory.memory_summary_token_count,
+        "memoryToolEvents": memory_tool_events,
+        "memoryStatus": loaded_memory.memory_status,
+        "memoryError": loaded_memory.memory_error,
+        "memoryProgressStep": loaded_memory.memory_progress_step,
+        "messages": messages,
+        "archived": archived != 0,
+        "createdAt": created_at,
+        "updatedAt": updated_at,
+    });
+    Ok(Some(session))
+}
+
+fn reconcile_stale_dynamic_memory_session_state(
+    app: &tauri::AppHandle,
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    session: &mut JsonValue,
+) -> Result<(), String> {
+    let is_processing = session
+        .get("memoryStatus")
+        .and_then(|value| value.as_str())
+        .map(|value| value == "processing")
+        .unwrap_or(false);
+    if !is_processing {
+        return Ok(());
+    }
+
+    let run_manager = app.state::<DynamicMemoryRunManager>().inner().clone();
+    let run_key = format!("chat:{}", session_id);
+    if run_manager.is_run_active(&run_key) {
+        return Ok(());
+    }
+
+    tracked_write(conn, |tx| {
+        tx.execute(
+            "UPDATE sessions SET memory_status = 'idle', memory_error = NULL, updated_at = ?1 WHERE id = ?2",
+            params![now_ms() as i64, session_id],
+        )
+    })?;
+
+    if let Some(map) = session.as_object_mut() {
+        map.insert("memoryStatus".into(), JsonValue::String("idle".into()));
+        map.insert("memoryError".into(), JsonValue::Null);
+    }
+
+    Ok(())
+}
+
+fn fetch_messages_page(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    limit: i64,
+    before_created_at: Option<i64>,
+    before_id: Option<&str>,
+) -> Result<Vec<JsonValue>, String> {
+    let mut sql = String::from(
+        "SELECT id, role, content, created_at, visible_in_chat, scene_edited, prompt_tokens, completion_tokens, total_tokens, selected_variant_id, is_pinned, memory_refs, used_lorebook_entries, attachments, reasoning, first_token_ms, tokens_per_second, model_id, mtp_stats, effective_at FROM messages WHERE session_id = ?1",
+    );
+
+    let use_before = before_created_at.is_some() && before_id.is_some();
+    if use_before {
+        sql.push_str(" AND (created_at < ?2 OR (created_at = ?2 AND id < ?3))");
+    }
+    sql.push_str(" ORDER BY created_at DESC, id DESC LIMIT ");
+    sql.push_str(&limit.to_string());
+
+    let mut raw_messages = Vec::new();
+    let mut message_ids: Vec<String> = Vec::new();
+    {
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+        if use_before {
+            let rows = stmt
+                .query_map(
+                    params![session_id, before_created_at.unwrap(), before_id.unwrap()],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, i64>(3)?,
+                            r.get::<_, i64>(4)?,
+                            r.get::<_, i64>(5)?,
+                            r.get::<_, Option<i64>>(6)?,
+                            r.get::<_, Option<i64>>(7)?,
+                            r.get::<_, Option<i64>>(8)?,
+                            r.get::<_, Option<String>>(9)?,
+                            r.get::<_, i64>(10)?,
+                            r.get::<_, Option<String>>(11)?,
+                            r.get::<_, Option<String>>(12)?,
+                            r.get::<_, Option<String>>(13)?,
+                            r.get::<_, Option<String>>(14)?,
+                            r.get::<_, Option<i64>>(15)?,
+                            r.get::<_, Option<f64>>(16)?,
+                            r.get::<_, Option<String>>(17)?,
+                            r.get::<_, Option<String>>(18)?,
+                            r.get::<_, Option<i64>>(19)?,
+                        ))
+                    },
+                )
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+            for row in rows {
+                let tuple =
+                    row.map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+                message_ids.push(tuple.0.clone());
+                raw_messages.push(tuple);
+            }
+        } else {
+            let rows = stmt
+                .query_map(params![session_id], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, i64>(4)?,
+                        r.get::<_, i64>(5)?,
+                        r.get::<_, Option<i64>>(6)?,
+                        r.get::<_, Option<i64>>(7)?,
+                        r.get::<_, Option<i64>>(8)?,
+                        r.get::<_, Option<String>>(9)?,
+                        r.get::<_, i64>(10)?,
+                        r.get::<_, Option<String>>(11)?,
+                        r.get::<_, Option<String>>(12)?,
+                        r.get::<_, Option<String>>(13)?,
+                        r.get::<_, Option<String>>(14)?,
+                        r.get::<_, Option<i64>>(15)?,
+                        r.get::<_, Option<f64>>(16)?,
+                        r.get::<_, Option<String>>(17)?,
+                        r.get::<_, Option<String>>(18)?,
+                        r.get::<_, Option<i64>>(19)?,
+                    ))
+                })
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+            for row in rows {
+                let tuple =
+                    row.map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+                message_ids.push(tuple.0.clone());
+                raw_messages.push(tuple);
+            }
+        }
+    }
+
+    let mut variants_by_message: HashMap<String, Vec<JsonValue>> = HashMap::new();
+    if !message_ids.is_empty() {
+        let placeholders = message_ids
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let vsql = format!(
+            "SELECT message_id, id, content, created_at, prompt_tokens, completion_tokens, total_tokens, reasoning, first_token_ms, tokens_per_second, mtp_stats FROM message_variants WHERE message_id IN ({}) ORDER BY created_at ASC",
+            placeholders
+        );
+        let mut vstmt = conn
+            .prepare(&vsql)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+        let vrows = vstmt
+            .query_map(rusqlite::params_from_iter(message_ids.iter()), |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, Option<i64>>(4)?,
+                    r.get::<_, Option<i64>>(5)?,
+                    r.get::<_, Option<i64>>(6)?,
+                    r.get::<_, Option<String>>(7)?,
+                    r.get::<_, Option<i64>>(8)?,
+                    r.get::<_, Option<f64>>(9)?,
+                    r.get::<_, Option<String>>(10)?,
+                ))
+            })
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+        for vr in vrows {
+            let (message_id, vid, vcontent, vcreated, vp, vc, vt, vreasoning, vftm, vtps, vmtp) =
+                vr.map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+            variants_by_message.entry(message_id).or_default().push({
+                let mut vobj = JsonMap::new();
+                vobj.insert("id".into(), JsonValue::String(vid));
+                if let Some(r) = vreasoning {
+                    vobj.insert("reasoning".into(), JsonValue::String(r));
+                }
+                vobj.insert("content".into(), JsonValue::String(vcontent));
+                vobj.insert("createdAt".into(), JsonValue::from(vcreated));
+                if let Some(usage) = json_usage_summary(vp, vc, vt, vftm, vtps, vmtp) {
+                    vobj.insert("usage".into(), usage);
+                }
+                JsonValue::Object(vobj)
+            });
+        }
+    }
+
+    let mut out: Vec<JsonValue> = Vec::with_capacity(raw_messages.len());
+    for (
+        mid,
+        role,
+        content,
+        mcreated,
+        visible_in_chat,
+        scene_edited,
+        p_tokens,
+        c_tokens,
+        t_tokens,
+        selected_variant_id,
+        is_pinned,
+        memory_refs_json,
+        used_lorebook_entries_json,
+        attachments_json,
+        reasoning,
+        first_token_ms,
+        tokens_per_second,
+        model_id,
+        mtp_stats,
+        effective_at,
+    ) in raw_messages
+    {
+        let mut mobj = JsonMap::new();
+        mobj.insert("id".into(), JsonValue::String(mid.clone()));
+        mobj.insert("role".into(), JsonValue::String(role));
+        mobj.insert("content".into(), JsonValue::String(content));
+        mobj.insert("createdAt".into(), JsonValue::from(mcreated));
+        if let Some(effective_at) = effective_at {
+            mobj.insert("effectiveAt".into(), JsonValue::from(effective_at));
+        }
+        if let Some(model_id_val) = model_id {
+            mobj.insert("modelId".into(), JsonValue::String(model_id_val));
+        }
+        if visible_in_chat != 0 {
+            mobj.insert("visibleInChat".into(), JsonValue::Bool(true));
+        }
+        if scene_edited != 0 {
+            mobj.insert("sceneEdited".into(), JsonValue::Bool(true));
+        }
+        if let Some(usage) = json_usage_summary(
+            p_tokens,
+            c_tokens,
+            t_tokens,
+            first_token_ms,
+            tokens_per_second,
+            mtp_stats,
+        ) {
+            mobj.insert("usage".into(), usage);
+        }
+        if let Some(variants) = variants_by_message.get(&mid) {
+            if !variants.is_empty() {
+                mobj.insert("variants".into(), JsonValue::Array(variants.clone()));
+            }
+        }
+        if let Some(sel) = selected_variant_id {
+            mobj.insert("selectedVariantId".into(), JsonValue::String(sel));
+        }
+        mobj.insert("isPinned".into(), JsonValue::Bool(is_pinned != 0));
+        if let Some(refs_json) = memory_refs_json {
+            if let Ok(parsed) = serde_json::from_str::<JsonValue>(&refs_json) {
+                mobj.insert("memoryRefs".into(), parsed);
+            }
+        }
+        if let Some(lorebook_json) = used_lorebook_entries_json {
+            if let Ok(parsed) = serde_json::from_str::<JsonValue>(&lorebook_json) {
+                mobj.insert("usedLorebookEntries".into(), parsed);
+            }
+        }
+        if let Some(att_json) = attachments_json {
+            if let Ok(parsed) = serde_json::from_str::<JsonValue>(&att_json) {
+                mobj.insert("attachments".into(), parsed);
+            }
+        }
+        if let Some(r) = reasoning {
+            mobj.insert("reasoning".into(), JsonValue::String(r));
+        }
+        out.push(JsonValue::Object(mobj));
+    }
+
+    // We fetched DESC for paging; return ASC for rendering.
+    out.reverse();
+    Ok(out)
+}
+
+#[tauri::command]
+pub fn sessions_list_ids(app: tauri::AppHandle) -> Result<String, String> {
+    let conn = open_db(&app)?;
+    let mut stmt = conn
+        .prepare("SELECT id FROM sessions ORDER BY created_at ASC")
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    let mut ids: Vec<String> = Vec::new();
+    for r in rows {
+        ids.push(r.map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?);
+    }
+    serde_json::to_string(&ids).map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))
+}
+
+/// List session previews without loading full message history.
+///
+/// This is intentionally designed to avoid `session_get` for every session when
+/// rendering chat lists and history.
+#[tauri::command]
+pub fn sessions_list_previews(
+    app: tauri::AppHandle,
+    character_id: Option<String>,
+    limit: Option<i64>,
+) -> Result<String, String> {
+    let conn = open_db(&app)?;
+
+    let mut sql = String::from(
+        r#"
+        SELECT
+          s.id,
+          s.character_id,
+          s.title,
+          s.updated_at,
+          s.archived,
+          COALESCE(
+            (
+              SELECT substr(m.content, 1, 400)
+              FROM messages m
+              WHERE m.session_id = s.id
+              ORDER BY m.created_at DESC
+              LIMIT 1
+            ),
+            ''
+          ) AS last_message,
+          (
+            SELECT COUNT(1)
+            FROM messages m
+            WHERE m.session_id = s.id
+          ) AS message_count,
+          s.parent_session_id,
+          s.branched_from_message_id,
+          s.root_session_id
+        FROM sessions s
+        WHERE (?1 IS NULL OR s.character_id = ?1)
+        ORDER BY s.updated_at DESC
+        "#,
+    );
+    if limit.is_some() {
+        sql.push_str(" LIMIT ?2");
+    }
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    let mut previews: Vec<SessionPreview> = Vec::new();
+    if limit.is_some() {
+        let rows = stmt
+            .query_map(params![character_id, limit], session_preview_from_row)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+        for row in rows {
+            previews
+                .push(row.map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?);
+        }
+    } else {
+        let rows = stmt
+            .query_map(params![character_id], session_preview_from_row)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+        for row in rows {
+            previews
+                .push(row.map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?);
+        }
+    }
+
+    serde_json::to_string(&previews)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))
+}
+
+#[tauri::command]
+pub fn sessions_list_branch_tree(
+    app: tauri::AppHandle,
+    session_id: String,
+) -> Result<String, String> {
+    let conn = open_db(&app)?;
+
+    let root: Option<String> = conn
+        .query_row(
+            "SELECT COALESCE(root_session_id, id) FROM sessions WHERE id = ?1",
+            params![session_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?
+        .flatten();
+
+    let Some(root) = root else {
+        return Ok("[]".to_string());
+    };
+
+    let sql = r#"
+        SELECT
+          s.id,
+          s.character_id,
+          s.title,
+          s.updated_at,
+          s.archived,
+          COALESCE(
+            (
+              SELECT substr(m.content, 1, 400)
+              FROM messages m
+              WHERE m.session_id = s.id
+              ORDER BY m.created_at DESC
+              LIMIT 1
+            ),
+            ''
+          ) AS last_message,
+          (
+            SELECT COUNT(1)
+            FROM messages m
+            WHERE m.session_id = s.id
+          ) AS message_count,
+          s.parent_session_id,
+          s.branched_from_message_id,
+          s.root_session_id
+        FROM sessions s
+        WHERE COALESCE(s.root_session_id, s.id) = ?1
+        ORDER BY s.created_at ASC
+        "#;
+
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    let mut previews: Vec<SessionPreview> = Vec::new();
+    let rows = stmt
+        .query_map(params![root], session_preview_from_row)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    for row in rows {
+        previews.push(row.map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?);
+    }
+
+    serde_json::to_string(&previews)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))
+}
+
+#[tauri::command]
+pub fn session_get(app: tauri::AppHandle, id: String) -> Result<Option<String>, String> {
+    let conn = open_db(&app)?;
+    let v = read_session(&conn, &id)?
+        .map(|mut value| {
+            reconcile_stale_dynamic_memory_session_state(&app, &conn, &id, &mut value)?;
+            Ok::<_, String>(value)
+        })
+        .transpose()?;
+    Ok(match v {
+        Some(json) => Some(
+            serde_json::to_string(&json)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+        ),
+        None => None,
+    })
+}
+
+#[tauri::command]
+pub fn session_get_meta(app: tauri::AppHandle, id: String) -> Result<Option<String>, String> {
+    let conn = open_db(&app)?;
+    let v = read_session_meta(&conn, &id)?
+        .map(|mut value| {
+            reconcile_stale_dynamic_memory_session_state(&app, &conn, &id, &mut value)?;
+            Ok::<_, String>(value)
+        })
+        .transpose()?;
+    Ok(match v {
+        Some(json) => Some(
+            serde_json::to_string(&json)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+        ),
+        None => None,
+    })
+}
+
+#[tauri::command]
+pub fn session_message_count(app: tauri::AppHandle, session_id: String) -> Result<i64, String> {
+    let conn = open_db(&app)?;
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(1) FROM messages WHERE session_id = ?",
+            params![session_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    Ok(count)
+}
+
+pub fn session_conversation_count(
+    app: tauri::AppHandle,
+    session_id: String,
+) -> Result<i64, String> {
+    let conn = open_db(&app)?;
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(1) FROM messages WHERE session_id = ? AND (role = 'user' OR role = 'assistant')",
+            params![session_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    Ok(count)
+}
+
+pub fn session_get_meta_typed<T>(app: &tauri::AppHandle, id: &str) -> Result<Option<T>, String>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let conn = open_db(app)?;
+    read_session_meta(&conn, id)?
+        .map(|mut value| {
+            reconcile_stale_dynamic_memory_session_state(app, &conn, id, &mut value)?;
+            Ok::<_, String>(value)
+        })
+        .transpose()?
+        .map(|value| {
+            serde_json::from_value(value)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))
+        })
+        .transpose()
+}
+
+pub fn messages_list_typed<T>(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    limit: i64,
+    before_created_at: Option<i64>,
+    before_id: Option<&str>,
+) -> Result<Vec<T>, String>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let conn = open_db(app)?;
+    serde_json::from_value(JsonValue::Array(fetch_messages_page(
+        &conn,
+        session_id,
+        limit,
+        before_created_at,
+        before_id,
+    )?))
+    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))
+}
+
+pub fn messages_list_pinned_typed<T>(
+    app: &tauri::AppHandle,
+    session_id: &str,
+) -> Result<Vec<T>, String>
+where
+    T: serde::de::DeserializeOwned,
+{
+    serde_json::from_value(
+        serde_json::to_value(messages_list_pinned_internal(app, session_id)?)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+    )
+    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))
+}
+
+pub fn session_upsert_meta_typed<T>(app: &tauri::AppHandle, session: &T) -> Result<(), String>
+where
+    T: serde::Serialize,
+{
+    let value = serde_json::to_value(session)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    upsert_session_meta_value(app, &value)
+}
+
+pub fn messages_upsert_batch_typed<T>(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    messages: &[T],
+) -> Result<(), String>
+where
+    T: serde::Serialize,
+{
+    let value = serde_json::to_value(messages)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    let Some(items) = value.as_array() else {
+        return Err(crate::utils::err_msg(
+            module_path!(),
+            line!(),
+            "messages must serialize to a JSON array",
+        ));
+    };
+    upsert_messages_batch_value(app, session_id, items)
+}
+
+#[tauri::command]
+pub fn messages_list(
+    app: tauri::AppHandle,
+    session_id: String,
+    limit: i64,
+    before_created_at: Option<i64>,
+    before_id: Option<String>,
+) -> Result<String, String> {
+    let conn = open_db(&app)?;
+    let messages = fetch_messages_page(
+        &conn,
+        &session_id,
+        limit.clamp(0, 500),
+        before_created_at,
+        before_id.as_deref(),
+    )?;
+    serde_json::to_string(&messages)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))
+}
+
+#[tauri::command]
+pub fn messages_list_pinned(app: tauri::AppHandle, session_id: String) -> Result<String, String> {
+    let conn = open_db(&app)?;
+    let mut stmt = conn
+        .prepare("SELECT id FROM messages WHERE session_id = ? AND is_pinned = 1 ORDER BY created_at ASC, id ASC")
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    let rows = stmt
+        .query_map(params![&session_id], |r| r.get::<_, String>(0))
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    let mut pinned_ids: Vec<String> = Vec::new();
+    for row in rows {
+        pinned_ids.push(row.map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?);
+    }
+    if pinned_ids.is_empty() {
+        return Ok("[]".to_string());
+    }
+
+    let placeholders = pinned_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT id, role, content, created_at, visible_in_chat, scene_edited, prompt_tokens, completion_tokens, total_tokens, selected_variant_id, is_pinned, memory_refs, used_lorebook_entries, attachments, reasoning, first_token_ms, tokens_per_second, model_id, mtp_stats, effective_at FROM messages WHERE session_id = ?1 AND id IN ({}) ORDER BY created_at ASC, id ASC",
+        placeholders
+    );
+    let mut mstmt = conn
+        .prepare(&sql)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    let mut params_vec: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(1 + pinned_ids.len());
+    params_vec.push(&session_id);
+    for id in pinned_ids.iter() {
+        params_vec.push(id);
+    }
+
+    let mrows = mstmt
+        .query_map(params_vec.as_slice(), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, Option<i64>>(6)?,
+                r.get::<_, Option<i64>>(7)?,
+                r.get::<_, Option<i64>>(8)?,
+                r.get::<_, Option<String>>(9)?,
+                r.get::<_, i64>(10)?,
+                r.get::<_, Option<String>>(11)?,
+                r.get::<_, Option<String>>(12)?,
+                r.get::<_, Option<String>>(13)?,
+                r.get::<_, Option<String>>(14)?,
+                r.get::<_, Option<i64>>(15)?,
+                r.get::<_, Option<f64>>(16)?,
+                r.get::<_, Option<String>>(17)?,
+                r.get::<_, Option<String>>(18)?,
+                r.get::<_, Option<i64>>(19)?,
+            ))
+        })
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    let mut raw_messages = Vec::new();
+    let mut message_ids: Vec<String> = Vec::new();
+    for row in mrows {
+        let tuple = row.map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+        message_ids.push(tuple.0.clone());
+        raw_messages.push(tuple);
+    }
+
+    let mut variants_by_message: HashMap<String, Vec<JsonValue>> = HashMap::new();
+    if !message_ids.is_empty() {
+        let placeholders = message_ids
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let vsql = format!(
+            "SELECT message_id, id, content, created_at, prompt_tokens, completion_tokens, total_tokens, reasoning, first_token_ms, tokens_per_second, mtp_stats FROM message_variants WHERE message_id IN ({}) ORDER BY created_at ASC",
+            placeholders
+        );
+        let mut vstmt = conn
+            .prepare(&vsql)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+        let vrows = vstmt
+            .query_map(rusqlite::params_from_iter(message_ids.iter()), |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, Option<i64>>(4)?,
+                    r.get::<_, Option<i64>>(5)?,
+                    r.get::<_, Option<i64>>(6)?,
+                    r.get::<_, Option<String>>(7)?,
+                    r.get::<_, Option<i64>>(8)?,
+                    r.get::<_, Option<f64>>(9)?,
+                    r.get::<_, Option<String>>(10)?,
+                ))
+            })
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+        for vr in vrows {
+            let (message_id, vid, vcontent, vcreated, vp, vc, vt, vreasoning, vftm, vtps, vmtp) =
+                vr.map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+            variants_by_message.entry(message_id).or_default().push({
+                let mut vobj = JsonMap::new();
+                vobj.insert("id".into(), JsonValue::String(vid));
+                if let Some(r) = vreasoning {
+                    vobj.insert("reasoning".into(), JsonValue::String(r));
+                }
+                vobj.insert("content".into(), JsonValue::String(vcontent));
+                vobj.insert("createdAt".into(), JsonValue::from(vcreated));
+                if let Some(usage) = json_usage_summary(vp, vc, vt, vftm, vtps, vmtp) {
+                    vobj.insert("usage".into(), usage);
+                }
+                JsonValue::Object(vobj)
+            });
+        }
+    }
+
+    let mut out: Vec<JsonValue> = Vec::with_capacity(raw_messages.len());
+    for (
+        mid,
+        role,
+        content,
+        mcreated,
+        visible_in_chat,
+        scene_edited,
+        p_tokens,
+        c_tokens,
+        t_tokens,
+        selected_variant_id,
+        is_pinned,
+        memory_refs_json,
+        used_lorebook_entries_json,
+        attachments_json,
+        reasoning,
+        first_token_ms,
+        tokens_per_second,
+        model_id,
+        mtp_stats,
+        effective_at,
+    ) in raw_messages
+    {
+        let mut mobj = JsonMap::new();
+        mobj.insert("id".into(), JsonValue::String(mid.clone()));
+        mobj.insert("role".into(), JsonValue::String(role));
+        mobj.insert("content".into(), JsonValue::String(content));
+        mobj.insert("createdAt".into(), JsonValue::from(mcreated));
+        if let Some(effective_at) = effective_at {
+            mobj.insert("effectiveAt".into(), JsonValue::from(effective_at));
+        }
+        if let Some(model_id_val) = model_id {
+            mobj.insert("modelId".into(), JsonValue::String(model_id_val));
+        }
+        if visible_in_chat != 0 {
+            mobj.insert("visibleInChat".into(), JsonValue::Bool(true));
+        }
+        if scene_edited != 0 {
+            mobj.insert("sceneEdited".into(), JsonValue::Bool(true));
+        }
+        if let Some(usage) = json_usage_summary(
+            p_tokens,
+            c_tokens,
+            t_tokens,
+            first_token_ms,
+            tokens_per_second,
+            mtp_stats,
+        ) {
+            mobj.insert("usage".into(), usage);
+        }
+        if let Some(variants) = variants_by_message.get(&mid) {
+            if !variants.is_empty() {
+                mobj.insert("variants".into(), JsonValue::Array(variants.clone()));
+            }
+        }
+        if let Some(sel) = selected_variant_id {
+            mobj.insert("selectedVariantId".into(), JsonValue::String(sel));
+        }
+        mobj.insert("isPinned".into(), JsonValue::Bool(is_pinned != 0));
+        if let Some(refs_json) = memory_refs_json {
+            if let Ok(parsed) = serde_json::from_str::<JsonValue>(&refs_json) {
+                mobj.insert("memoryRefs".into(), parsed);
+            }
+        }
+        if let Some(lorebook_json) = used_lorebook_entries_json {
+            if let Ok(parsed) = serde_json::from_str::<JsonValue>(&lorebook_json) {
+                mobj.insert("usedLorebookEntries".into(), parsed);
+            }
+        }
+        if let Some(att_json) = attachments_json {
+            if let Ok(parsed) = serde_json::from_str::<JsonValue>(&att_json) {
+                mobj.insert("attachments".into(), parsed);
+            }
+        }
+        if let Some(r) = reasoning {
+            mobj.insert("reasoning".into(), JsonValue::String(r));
+        }
+        out.push(JsonValue::Object(mobj));
+    }
+
+    serde_json::to_string(&out).map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))
+}
+
+#[tauri::command]
+pub fn session_upsert_meta(app: tauri::AppHandle, session_json: String) -> Result<(), String> {
+    let mut conn = open_db(&app)?;
+    let s: JsonValue = serde_json::from_str(&session_json)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    let id = s
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "id is required".to_string())?
+        .to_string();
+    let character_id = s
+        .get("characterId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "characterId is required".to_string())?;
+    let title = s.get("title").and_then(|v| v.as_str()).unwrap_or("");
+    let parent_session_id = s
+        .get("parentSessionId")
+        .and_then(|v| v.as_str())
+        .map(|x| x.to_string());
+    let branched_from_message_id = s
+        .get("branchedFromMessageId")
+        .and_then(|v| v.as_str())
+        .map(|x| x.to_string());
+    let root_session_id = s
+        .get("rootSessionId")
+        .and_then(|v| v.as_str())
+        .map(|x| x.to_string())
+        .or_else(|| Some(id.clone()));
+    let background_image_path = s
+        .get("backgroundImagePath")
+        .and_then(|v| v.as_str())
+        .map(|x| x.to_string());
+    let system_prompt = s
+        .get("systemPrompt")
+        .and_then(|v| v.as_str())
+        .map(|x| x.to_string());
+    let mode = s
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .map(|x| x.to_string())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "roleplay".to_string());
+    let selected_scene_id = s
+        .get("selectedSceneId")
+        .and_then(|v| v.as_str())
+        .map(|x| x.to_string());
+    let prompt_template_id = s
+        .get("promptTemplateId")
+        .and_then(|v| v.as_str())
+        .map(|x| x.to_string());
+    let lorebook_ids_override_json = resolve_lorebook_ids_override_json(&conn, &id, &s)?;
+    let author_note = resolve_author_note(&conn, &id, &s)?;
+    let persona_id = s
+        .get("personaId")
+        .and_then(|v| v.as_str())
+        .map(|x| x.to_string());
+    let persona_disabled = s
+        .get("personaDisabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false) as i64;
+    let voice_autoplay = s
+        .get("voiceAutoplay")
+        .and_then(|v| v.as_bool())
+        .map(|value| if value { 1 } else { 0 });
+    let archived = s.get("archived").and_then(|v| v.as_bool()).unwrap_or(false) as i64;
+    let created_at = s
+        .get("createdAt")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(now_ms() as i64);
+    let updated_at = now_ms() as i64;
+
+    let memories_json = match s.get("memories") {
+        Some(v) => serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string()),
+        None => "[]".to_string(),
+    };
+    let memory_summary = s
+        .get("memorySummary")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let memory_summary_token_count = s
+        .get("memorySummaryTokenCount")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let memory_tool_events_json = match s.get("memoryToolEvents") {
+        Some(v) => serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string()),
+        None => "[]".to_string(),
+    };
+    let memory_embeddings_json = match s.get("memoryEmbeddings") {
+        Some(v) => serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string()),
+        None => "[]".to_string(),
+    };
+    let continuity_persona_id = if persona_disabled == 0 {
+        persona_id.as_deref()
+    } else {
+        None
+    };
+    let companion_state_json =
+        resolve_companion_state_json(&conn, &character_id, &mode, continuity_persona_id, &s)?;
+    let memory_status = s
+        .get("memoryStatus")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let memory_error = s
+        .get("memoryError")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let memory_progress_step = s.get("memoryProgressStep").and_then(|v| v.as_i64());
+    let shared_memory_enabled = persist_shared_memory_from_session_json(
+        &mut conn,
+        &id,
+        &character_id,
+        &mode,
+        &memories_json,
+        &memory_embeddings_json,
+        memory_summary.clone(),
+        memory_summary_token_count,
+        &memory_tool_events_json,
+        memory_status.clone(),
+        memory_error.clone(),
+        memory_progress_step,
+    )?;
+    let session_memories_json = if shared_memory_enabled {
+        "[]".to_string()
+    } else {
+        memories_json.clone()
+    };
+    let session_memory_embeddings_json = if shared_memory_enabled {
+        "[]".to_string()
+    } else {
+        memory_embeddings_json.clone()
+    };
+    let session_memory_summary = if shared_memory_enabled {
+        None
+    } else {
+        memory_summary.clone()
+    };
+    let session_memory_summary_token_count = if shared_memory_enabled {
+        0
+    } else {
+        memory_summary_token_count
+    };
+    let session_memory_tool_events_json = if shared_memory_enabled {
+        "[]".to_string()
+    } else {
+        memory_tool_events_json.clone()
+    };
+    let session_memory_status = if shared_memory_enabled {
+        None
+    } else {
+        memory_status.clone()
+    };
+    let session_memory_error = if shared_memory_enabled {
+        None
+    } else {
+        memory_error.clone()
+    };
+    let session_memory_progress_step = if shared_memory_enabled {
+        None
+    } else {
+        memory_progress_step
+    };
+
+    let adv = s.get("advancedModelSettings");
+    let advanced_model_settings_json = serialize_session_advanced_model_settings(adv);
+    let temperature = adv
+        .and_then(|v| v.get("temperature"))
+        .and_then(|v| v.as_f64());
+    let top_p = adv.and_then(|v| v.get("topP")).and_then(|v| v.as_f64());
+    let max_output_tokens = adv
+        .and_then(|v| v.get("maxOutputTokens"))
+        .and_then(|v| v.as_i64());
+    let frequency_penalty = adv
+        .and_then(|v| v.get("frequencyPenalty"))
+        .and_then(|v| v.as_f64());
+    let presence_penalty = adv
+        .and_then(|v| v.get("presencePenalty"))
+        .and_then(|v| v.as_f64());
+    let top_k = adv.and_then(|v| v.get("topK")).and_then(|v| v.as_i64());
+
+    if let Some(companion_state) = companion_state_json
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<JsonValue>(value).ok())
+    {
+        crate::storage_manager::companion_shared_memory::persist_continuity_from_state(
+            &conn,
+            Some(&id),
+            &character_id,
+            continuity_persona_id,
+            &companion_state,
+        )?;
+    }
+
+    conn.execute(
+        r#"INSERT INTO sessions (id, character_id, title, parent_session_id, branched_from_message_id, root_session_id, background_image_path, system_prompt, mode, selected_scene_id, prompt_template_id, lorebook_ids_override, author_note, persona_id, persona_disabled, voice_autoplay, temperature, top_p, max_output_tokens, frequency_penalty, presence_penalty, top_k, advanced_model_settings, companion_state, memories, memory_embeddings, memory_summary, memory_summary_token_count, memory_tool_events, memory_status, memory_error, memory_progress_step, archived, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              character_id=excluded.character_id,
+              title=excluded.title,
+              parent_session_id=excluded.parent_session_id,
+              branched_from_message_id=excluded.branched_from_message_id,
+              root_session_id=excluded.root_session_id,
+              background_image_path=excluded.background_image_path,
+              system_prompt=excluded.system_prompt,
+              mode=excluded.mode,
+              selected_scene_id=excluded.selected_scene_id,
+              prompt_template_id=excluded.prompt_template_id,
+              lorebook_ids_override=excluded.lorebook_ids_override,
+              author_note=excluded.author_note,
+              persona_id=excluded.persona_id,
+              persona_disabled=excluded.persona_disabled,
+              voice_autoplay=excluded.voice_autoplay,
+              temperature=excluded.temperature,
+              top_p=excluded.top_p,
+              max_output_tokens=excluded.max_output_tokens,
+              frequency_penalty=excluded.frequency_penalty,
+              presence_penalty=excluded.presence_penalty,
+              top_k=excluded.top_k,
+              advanced_model_settings=excluded.advanced_model_settings,
+              companion_state=excluded.companion_state,
+              memories=excluded.memories,
+              memory_embeddings=excluded.memory_embeddings,
+              memory_summary=excluded.memory_summary,
+              memory_summary_token_count=excluded.memory_summary_token_count,
+              memory_tool_events=excluded.memory_tool_events,
+              memory_status=excluded.memory_status,
+              memory_error=excluded.memory_error,
+              memory_progress_step=excluded.memory_progress_step,
+              archived=excluded.archived,
+              updated_at=excluded.updated_at"#,
+        params![
+            &id,
+            character_id,
+            title,
+            parent_session_id,
+            branched_from_message_id,
+            root_session_id,
+            background_image_path,
+            system_prompt,
+            mode,
+            selected_scene_id,
+            prompt_template_id,
+            lorebook_ids_override_json,
+            author_note,
+            persona_id,
+            persona_disabled,
+            voice_autoplay,
+            temperature,
+            top_p,
+            max_output_tokens,
+            frequency_penalty,
+            presence_penalty,
+            top_k,
+            advanced_model_settings_json,
+            companion_state_json,
+            &session_memories_json,
+            &session_memory_embeddings_json,
+            session_memory_summary,
+            session_memory_summary_token_count,
+            &session_memory_tool_events_json,
+            session_memory_status,
+            session_memory_error,
+            session_memory_progress_step,
+            archived,
+            created_at,
+            updated_at
+        ],
+    )
+    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    Ok(())
+}
+
+#[tauri::command]
+pub fn messages_upsert_batch(
+    app: tauri::AppHandle,
+    session_id: String,
+    messages_json: String,
+) -> Result<(), String> {
+    let mut conn = open_db(&app)?;
+    let v: JsonValue = serde_json::from_str(&messages_json)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    let Some(msgs) = v.as_array() else {
+        return Err(crate::utils::err_msg(
+            module_path!(),
+            line!(),
+            "messages_json must be a JSON array",
+        ));
+    };
+
+    log_info(
+        &app,
+        "messages_upsert_batch",
+        format!(
+            "Upserting {} messages for session {}",
+            msgs.len(),
+            session_id
+        ),
+    );
+
+    let now = now_ms() as i64;
+    let tx = conn.transaction().map_err(|e| {
+        log_error(
+            &app,
+            "messages_upsert_batch",
+            format!("Failed to begin transaction: {}", e),
+        );
+        e.to_string()
+    })?;
+
+    for m in msgs {
+        let mid = m
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| "message.id is required".to_string())?;
+        let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+        let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        let mcreated = m.get("createdAt").and_then(|v| v.as_i64()).unwrap_or(now);
+        let is_pinned = m.get("isPinned").and_then(|v| v.as_bool()).unwrap_or(false) as i64;
+        let visible_in_chat = m
+            .get("visibleInChat")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false) as i64;
+        let scene_edited = m
+            .get("sceneEdited")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false) as i64;
+        let usage = m.get("usage");
+        let pt = usage
+            .and_then(|u| u.get("promptTokens"))
+            .and_then(|v| v.as_i64());
+        let ct = usage
+            .and_then(|u| u.get("completionTokens"))
+            .and_then(|v| v.as_i64());
+        let tt = usage
+            .and_then(|u| u.get("totalTokens"))
+            .and_then(|v| v.as_i64());
+        let selected_variant_id = m
+            .get("selectedVariantId")
+            .and_then(|v| v.as_str())
+            .map(|x| x.to_string());
+        let memory_refs = m
+            .get("memoryRefs")
+            .cloned()
+            .unwrap_or_else(|| JsonValue::Array(Vec::new()));
+        let used_lorebook_entries = m
+            .get("usedLorebookEntries")
+            .cloned()
+            .unwrap_or_else(|| JsonValue::Array(Vec::new()));
+        let attachments = m
+            .get("attachments")
+            .cloned()
+            .unwrap_or_else(|| JsonValue::Array(Vec::new()));
+        let reasoning = m
+            .get("reasoning")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        tx.execute(
+            r#"INSERT INTO messages (id, session_id, role, content, created_at, effective_at, visible_in_chat, scene_edited, prompt_tokens, completion_tokens, total_tokens, selected_variant_id, is_pinned, memory_refs, used_lorebook_entries, attachments, reasoning, first_token_ms, tokens_per_second, model_id, mtp_stats)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                 session_id=excluded.session_id,
+                 role=excluded.role,
+                 content=excluded.content,
+                 created_at=excluded.created_at,
+                 effective_at=COALESCE(messages.effective_at, excluded.effective_at),
+                 visible_in_chat=excluded.visible_in_chat,
+                 scene_edited=excluded.scene_edited,
+                 prompt_tokens=excluded.prompt_tokens,
+                 completion_tokens=excluded.completion_tokens,
+                 total_tokens=excluded.total_tokens,
+                 selected_variant_id=excluded.selected_variant_id,
+                 is_pinned=excluded.is_pinned,
+                 memory_refs=excluded.memory_refs,
+                 used_lorebook_entries=excluded.used_lorebook_entries,
+                 attachments=excluded.attachments,
+                 reasoning=excluded.reasoning, first_token_ms=excluded.first_token_ms, tokens_per_second=excluded.tokens_per_second, model_id=excluded.model_id, mtp_stats=excluded.mtp_stats"#,
+            params![
+                &mid,
+                &session_id,
+                role,
+                content,
+                mcreated,
+                resolved_message_effective_at(m, role, mcreated),
+                visible_in_chat,
+                scene_edited,
+                pt,
+                ct,
+                tt,
+                selected_variant_id,
+                is_pinned,
+                memory_refs.to_string(),
+                used_lorebook_entries.to_string(),
+                attachments.to_string(),
+                reasoning,
+                usage.and_then(|u| u.get("firstTokenMs")).and_then(|v| v.as_i64()),
+                usage.and_then(|u| u.get("tokensPerSecond")).and_then(|v| v.as_f64()),
+                m.get("modelId").and_then(|v| v.as_str()),
+                usage.and_then(|u| u.get("mtpStats")).map(|v| v.to_string())
+            ],
+        )
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+        if m.get("variants").is_some() {
+            tx.execute(
+                "DELETE FROM message_variants WHERE message_id = ?",
+                params![&mid],
+            )
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+            if let Some(vars) = m.get("variants").and_then(|v| v.as_array()) {
+                for v in vars {
+                    let vid = v
+                        .get("id")
+                        .and_then(|x| x.as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                    let vcontent = v.get("content").and_then(|x| x.as_str()).unwrap_or("");
+                    let vcreated = v.get("createdAt").and_then(|x| x.as_i64()).unwrap_or(now);
+                    let u = v.get("usage");
+                    let vp = u
+                        .and_then(|u| u.get("promptTokens"))
+                        .and_then(|v| v.as_i64());
+                    let vc = u
+                        .and_then(|u| u.get("completionTokens"))
+                        .and_then(|v| v.as_i64());
+                    let vt = u
+                        .and_then(|u| u.get("totalTokens"))
+                        .and_then(|v| v.as_i64());
+                    let vreasoning = v
+                        .get("reasoning")
+                        .and_then(|x| x.as_str())
+                        .map(|s| s.to_string());
+                    tx.execute(
+                        "INSERT INTO message_variants (id, message_id, content, created_at, prompt_tokens, completion_tokens, total_tokens, reasoning, first_token_ms, tokens_per_second, mtp_stats) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        params![vid, &mid, vcontent, vcreated, vp, vc, vt, vreasoning, u.and_then(|u| u.get("firstTokenMs")).and_then(|v| v.as_i64()), u.and_then(|u| u.get("tokensPerSecond")).and_then(|v| v.as_f64()), u.and_then(|u| u.get("mtpStats")).map(|v| v.to_string())],
+                    )
+                    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+                }
+            }
+        }
+    }
+
+    tx.execute(
+        "UPDATE sessions SET updated_at = ? WHERE id = ?",
+        params![now, &session_id],
+    )
+    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    tx.commit()
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))
+}
+
+#[tauri::command]
+pub fn message_delete(
+    app: tauri::AppHandle,
+    session_id: String,
+    message_id: String,
+) -> Result<(), String> {
+    log_info(
+        &app,
+        "message_delete",
+        format!(
+            "Deleting message {} from session {}",
+            message_id, session_id
+        ),
+    );
+    let conn = open_db(&app)?;
+    let now = now_ms() as i64;
+    tracked_write(&conn, |tx| {
+        tx.execute(
+            "DELETE FROM messages WHERE id = ? AND session_id = ?",
+            params![&message_id, &session_id],
+        )?;
+        tx.execute(
+            "UPDATE sessions SET updated_at = ? WHERE id = ?",
+            params![now, &session_id],
+        )?;
+        Ok(())
+    })
+    .map_err(|error| {
+        log_error(
+            &app,
+            "message_delete",
+            format!("Failed to delete message: {}", error),
+        );
+        error
+    })?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn messages_delete_after(
+    app: tauri::AppHandle,
+    session_id: String,
+    message_id: String,
+) -> Result<(), String> {
+    let mut conn = open_db(&app)?;
+    let now = now_ms() as i64;
+    tracked_write_string(&conn, |tx| {
+        let ids: Vec<String> = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT id FROM messages WHERE session_id = ? ORDER BY created_at ASC, id ASC",
+                )
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+            let rows = stmt
+                .query_map(params![&session_id], |r| r.get::<_, String>(0))
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+            let mut ids: Vec<String> = Vec::new();
+            for row in rows {
+                ids.push(row.map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?);
+            }
+            ids
+        };
+
+        let Some(pos) = ids.iter().position(|id| id == &message_id) else {
+            return Err(crate::utils::err_msg(
+                module_path!(),
+                line!(),
+                "Message not found in session",
+            ));
+        };
+
+        let to_delete = &ids[(pos + 1)..];
+        log_info(
+            &app,
+            "messages_delete_after",
+            format!(
+                "Rewinding session {} after message {} (deleting {} messages)",
+                session_id,
+                message_id,
+                to_delete.len()
+            ),
+        );
+        for id in to_delete {
+            tx.execute(
+                "DELETE FROM messages WHERE id = ? AND session_id = ?",
+                params![id, &session_id],
+            )
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+        }
+
+        tx.execute(
+            "UPDATE sessions SET updated_at = ? WHERE id = ?",
+            params![now, &session_id],
+        )
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+        Ok(())
+    })?;
+
+    rewind_session_memory_state(&mut conn, &session_id)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn session_upsert(app: tauri::AppHandle, session_json: String) -> Result<(), String> {
+    let conn = open_db(&app)?;
+    let s: JsonValue = serde_json::from_str(&session_json)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    let id = s
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "id is required".to_string())?
+        .to_string();
+    let character_id = s
+        .get("characterId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "characterId is required".to_string())?;
+    let title = s.get("title").and_then(|v| v.as_str()).unwrap_or("");
+    let parent_session_id = s
+        .get("parentSessionId")
+        .and_then(|v| v.as_str())
+        .map(|x| x.to_string());
+    let branched_from_message_id = s
+        .get("branchedFromMessageId")
+        .and_then(|v| v.as_str())
+        .map(|x| x.to_string());
+    let root_session_id = s
+        .get("rootSessionId")
+        .and_then(|v| v.as_str())
+        .map(|x| x.to_string())
+        .or_else(|| Some(id.clone()));
+    let background_image_path = s
+        .get("backgroundImagePath")
+        .and_then(|v| v.as_str())
+        .map(|x| x.to_string());
+    let system_prompt = s
+        .get("systemPrompt")
+        .and_then(|v| v.as_str())
+        .map(|x| x.to_string());
+    let mode = s
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .map(|x| x.to_string())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "roleplay".to_string());
+    let selected_scene_id = s
+        .get("selectedSceneId")
+        .and_then(|v| v.as_str())
+        .map(|x| x.to_string());
+    let prompt_template_id = s
+        .get("promptTemplateId")
+        .and_then(|v| v.as_str())
+        .map(|x| x.to_string());
+    let lorebook_ids_override_json = resolve_lorebook_ids_override_json(&conn, &id, &s)?;
+    let author_note = resolve_author_note(&conn, &id, &s)?;
+    let persona_id = s
+        .get("personaId")
+        .and_then(|v| v.as_str())
+        .map(|x| x.to_string());
+    let persona_disabled = s
+        .get("personaDisabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false) as i64;
+    let voice_autoplay = s
+        .get("voiceAutoplay")
+        .and_then(|v| v.as_bool())
+        .map(|value| if value { 1 } else { 0 });
+    let archived = s.get("archived").and_then(|v| v.as_bool()).unwrap_or(false) as i64;
+    let created_at = s
+        .get("createdAt")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(now_ms() as i64);
+    let updated_at = now_ms() as i64;
+
+    // Handle memories - serialize to JSON string
+    let memories_json = match s.get("memories") {
+        Some(v) => serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string()),
+        None => "[]".to_string(),
+    };
+    /*let memory_embeddings_json = match s.get("memoryEmbeddings") {
+        Some(v) => serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string()),
+        None => "[]".to_string(),
+    };*/
+    let memory_summary = s
+        .get("memorySummary")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    // Debug log
+    log_info(
+        &app,
+        "session_upsert",
+        format!(
+            "Saving session {}. Memory summary present: {}, value: {:?}",
+            id,
+            memory_summary.is_some(),
+            memory_summary
+        ),
+    );
+    let memory_summary_token_count = s
+        .get("memorySummaryTokenCount")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let memory_tool_events_json = match s.get("memoryToolEvents") {
+        Some(v) => serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string()),
+        None => "[]".to_string(),
+    };
+    let memory_embeddings_json = match s.get("memoryEmbeddings") {
+        Some(v) => serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string()),
+        None => "[]".to_string(),
+    };
+    let continuity_persona_id = if persona_disabled == 0 {
+        persona_id.as_deref()
+    } else {
+        None
+    };
+    let companion_state_json =
+        resolve_companion_state_json(&conn, &character_id, &mode, continuity_persona_id, &s)?;
+
+    let adv = s.get("advancedModelSettings");
+    let advanced_model_settings_json = serialize_session_advanced_model_settings(adv);
+    let temperature = adv
+        .and_then(|v| v.get("temperature"))
+        .and_then(|v| v.as_f64());
+    let top_p = adv.and_then(|v| v.get("topP")).and_then(|v| v.as_f64());
+    let max_output_tokens = adv
+        .and_then(|v| v.get("maxOutputTokens"))
+        .and_then(|v| v.as_i64());
+    let frequency_penalty = adv
+        .and_then(|v| v.get("frequencyPenalty"))
+        .and_then(|v| v.as_f64());
+    let presence_penalty = adv
+        .and_then(|v| v.get("presencePenalty"))
+        .and_then(|v| v.as_f64());
+    let top_k = adv.and_then(|v| v.get("topK")).and_then(|v| v.as_i64());
+
+    tracked_write_string(&conn, |tx| {
+        if let Some(companion_state) = companion_state_json
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<JsonValue>(value).ok())
+        {
+            crate::storage_manager::companion_shared_memory::persist_continuity_from_state(
+                tx,
+                Some(&id),
+                &character_id,
+                continuity_persona_id,
+                &companion_state,
+            )?;
+        }
+        let shared_memory_enabled = persist_shared_memory_from_session_json(
+            tx,
+            &id,
+            &character_id,
+            &mode,
+            &memories_json,
+            &memory_embeddings_json,
+            memory_summary.clone(),
+            memory_summary_token_count,
+            &memory_tool_events_json,
+            None,
+            None,
+            None,
+        )?;
+        let session_memories_json = if shared_memory_enabled {
+            "[]".to_string()
+        } else {
+            memories_json.clone()
+        };
+        let session_memory_embeddings_json = if shared_memory_enabled {
+            "[]".to_string()
+        } else {
+            memory_embeddings_json.clone()
+        };
+        let session_memory_summary = if shared_memory_enabled {
+            None
+        } else {
+            memory_summary.clone()
+        };
+        let session_memory_summary_token_count = if shared_memory_enabled {
+            0
+        } else {
+            memory_summary_token_count
+        };
+        let session_memory_tool_events_json = if shared_memory_enabled {
+            "[]".to_string()
+        } else {
+            memory_tool_events_json.clone()
+        };
+        tx.execute(
+        r#"INSERT INTO sessions (id, character_id, title, parent_session_id, branched_from_message_id, root_session_id, background_image_path, system_prompt, mode, selected_scene_id, prompt_template_id, lorebook_ids_override, author_note, persona_id, persona_disabled, voice_autoplay, temperature, top_p, max_output_tokens, frequency_penalty, presence_penalty, top_k, advanced_model_settings, companion_state, memories, memory_embeddings, memory_summary, memory_summary_token_count, memory_tool_events, archived, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              character_id=excluded.character_id,
+              title=excluded.title,
+              parent_session_id=excluded.parent_session_id,
+              branched_from_message_id=excluded.branched_from_message_id,
+              root_session_id=excluded.root_session_id,
+              background_image_path=excluded.background_image_path,
+              system_prompt=excluded.system_prompt,
+              mode=excluded.mode,
+              selected_scene_id=excluded.selected_scene_id,
+              prompt_template_id=excluded.prompt_template_id,
+              lorebook_ids_override=excluded.lorebook_ids_override,
+              author_note=excluded.author_note,
+              persona_id=excluded.persona_id,
+              persona_disabled=excluded.persona_disabled,
+              voice_autoplay=excluded.voice_autoplay,
+              temperature=excluded.temperature,
+              top_p=excluded.top_p,
+              max_output_tokens=excluded.max_output_tokens,
+              frequency_penalty=excluded.frequency_penalty,
+              presence_penalty=excluded.presence_penalty,
+              top_k=excluded.top_k,
+              advanced_model_settings=excluded.advanced_model_settings,
+              companion_state=excluded.companion_state,
+              memories=excluded.memories,
+              memory_embeddings=excluded.memory_embeddings,
+              memory_summary=excluded.memory_summary,
+              memory_summary_token_count=excluded.memory_summary_token_count,
+              memory_tool_events=excluded.memory_tool_events,
+              archived=excluded.archived,
+              updated_at=excluded.updated_at"#,
+        params![&id, character_id, title, parent_session_id, branched_from_message_id, root_session_id, background_image_path, system_prompt, mode, selected_scene_id, prompt_template_id, lorebook_ids_override_json, author_note, persona_id, persona_disabled, voice_autoplay, temperature, top_p, max_output_tokens, frequency_penalty, presence_penalty, top_k, advanced_model_settings_json, companion_state_json, &session_memories_json, &session_memory_embeddings_json, session_memory_summary, session_memory_summary_token_count, &session_memory_tool_events_json, archived, created_at, updated_at],
+    ).map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+        if let Some(msgs) = s.get("messages").and_then(|v| v.as_array()) {
+            for m in msgs {
+                let mid = m
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+                let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                let mcreated = m
+                    .get("createdAt")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(updated_at);
+                let is_pinned = m.get("isPinned").and_then(|v| v.as_bool()).unwrap_or(false) as i64;
+                let visible_in_chat = m
+                    .get("visibleInChat")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false) as i64;
+                let scene_edited = m
+                    .get("sceneEdited")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false) as i64;
+                let usage = m.get("usage");
+                let pt = usage
+                    .and_then(|u| u.get("promptTokens"))
+                    .and_then(|v| v.as_i64());
+                let ct = usage
+                    .and_then(|u| u.get("completionTokens"))
+                    .and_then(|v| v.as_i64());
+                let tt = usage
+                    .and_then(|u| u.get("totalTokens"))
+                    .and_then(|v| v.as_i64());
+                let selected_variant_id = m
+                    .get("selectedVariantId")
+                    .and_then(|v| v.as_str())
+                    .map(|x| x.to_string());
+                let memory_refs = m
+                    .get("memoryRefs")
+                    .cloned()
+                    .unwrap_or_else(|| JsonValue::Array(Vec::new()));
+                let used_lorebook_entries = m
+                    .get("usedLorebookEntries")
+                    .cloned()
+                    .unwrap_or_else(|| JsonValue::Array(Vec::new()));
+                let attachments = m
+                    .get("attachments")
+                    .cloned()
+                    .unwrap_or_else(|| JsonValue::Array(Vec::new()));
+                let reasoning = m
+                    .get("reasoning")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                tx.execute(
+                r#"INSERT INTO messages (id, session_id, role, content, created_at, effective_at, visible_in_chat, scene_edited, prompt_tokens, completion_tokens, total_tokens, selected_variant_id, is_pinned, memory_refs, used_lorebook_entries, attachments, reasoning, first_token_ms, tokens_per_second, model_id, mtp_stats)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET
+                     session_id=excluded.session_id,
+                     role=excluded.role,
+                     content=excluded.content,
+                     created_at=excluded.created_at,
+                     effective_at=COALESCE(messages.effective_at, excluded.effective_at),
+                     visible_in_chat=excluded.visible_in_chat,
+                     scene_edited=excluded.scene_edited,
+                     prompt_tokens=excluded.prompt_tokens,
+                     completion_tokens=excluded.completion_tokens,
+                     total_tokens=excluded.total_tokens,
+                     selected_variant_id=excluded.selected_variant_id,
+                     is_pinned=excluded.is_pinned,
+                     memory_refs=excluded.memory_refs,
+                     used_lorebook_entries=excluded.used_lorebook_entries,
+                     attachments=excluded.attachments,
+                     reasoning=excluded.reasoning, first_token_ms=excluded.first_token_ms, tokens_per_second=excluded.tokens_per_second, model_id=excluded.model_id, mtp_stats=excluded.mtp_stats"#,
+                params![
+                    &mid,
+                    &id,
+                    role,
+                    content,
+                    mcreated,
+                    resolved_message_effective_at(m, role, mcreated),
+                    visible_in_chat,
+                    scene_edited,
+                    pt,
+                    ct,
+                    tt,
+                    selected_variant_id,
+                    is_pinned,
+                    memory_refs.to_string(),
+                    used_lorebook_entries.to_string(),
+                    attachments.to_string(),
+                    reasoning,
+                    usage.and_then(|u| u.get("firstTokenMs")).and_then(|v| v.as_i64()),
+                    usage.and_then(|u| u.get("tokensPerSecond")).and_then(|v| v.as_f64()),
+                m.get("modelId").and_then(|v| v.as_str()),
+                usage.and_then(|u| u.get("mtpStats")).map(|v| v.to_string())
+                ],
+            ).map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+                if m.get("variants").is_some() {
+                    tx.execute(
+                        "DELETE FROM message_variants WHERE message_id = ?",
+                        params![&mid],
+                    )
+                    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+                    if let Some(vars) = m.get("variants").and_then(|v| v.as_array()) {
+                        for v in vars {
+                            let vid = v
+                                .get("id")
+                                .and_then(|x| x.as_str())
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                            let vcontent = v.get("content").and_then(|x| x.as_str()).unwrap_or("");
+                            let vcreated = v
+                                .get("createdAt")
+                                .and_then(|x| x.as_i64())
+                                .unwrap_or(updated_at);
+                            let u = v.get("usage");
+                            let vp = u
+                                .and_then(|u| u.get("promptTokens"))
+                                .and_then(|v| v.as_i64());
+                            let vc = u
+                                .and_then(|u| u.get("completionTokens"))
+                                .and_then(|v| v.as_i64());
+                            let vt = u
+                                .and_then(|u| u.get("totalTokens"))
+                                .and_then(|v| v.as_i64());
+                            let vreasoning = v
+                                .get("reasoning")
+                                .and_then(|x| x.as_str())
+                                .map(|s| s.to_string());
+                            tx.execute(
+                            "INSERT INTO message_variants (id, message_id, content, created_at, prompt_tokens, completion_tokens, total_tokens, reasoning, first_token_ms, tokens_per_second, mtp_stats) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            params![vid, &mid, vcontent, vcreated, vp, vc, vt, vreasoning, u.and_then(|u| u.get("firstTokenMs")).and_then(|v| v.as_i64()), u.and_then(|u| u.get("tokensPerSecond")).and_then(|v| v.as_f64()), u.and_then(|u| u.get("mtpStats")).map(|v| v.to_string())],
+                        )
+                        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+#[tauri::command]
+pub fn session_delete(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    log_info(&app, "session_delete", format!("Deleting session {}", id));
+    let conn = open_db(&app)?;
+    tracked_write_string(&conn, |tx| {
+        crate::storage_manager::memory_embeddings::delete_all_for_session(
+            tx,
+            &id,
+            crate::storage_manager::memory_embeddings::SessionKind::Session,
+        )?;
+        tx.execute("DELETE FROM sessions WHERE id = ?", params![id])
+            .map_err(|e| {
+                log_error(
+                    &app,
+                    "session_delete",
+                    format!("Failed to delete session: {}", e),
+                );
+                e.to_string()
+            })?;
+        Ok(())
+    })?;
+
+    Ok(())
+}
+
+#[tauri::command]
+pub fn session_archive(app: tauri::AppHandle, id: String, archived: bool) -> Result<(), String> {
+    let conn = open_db(&app)?;
+    let now = now_ms() as i64;
+    tracked_write(&conn, |tx| {
+        tx.execute(
+            "UPDATE sessions SET archived = ?, updated_at = ? WHERE id = ?",
+            params![if archived { 1 } else { 0 }, now, id],
+        )
+    })?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn session_update_title(
+    app: tauri::AppHandle,
+    id: String,
+    title: String,
+) -> Result<(), String> {
+    let conn = open_db(&app)?;
+    let now = now_ms() as i64;
+    tracked_write(&conn, |tx| {
+        tx.execute(
+            "UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?",
+            params![title, now, id],
+        )
+    })?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn session_update_author_note(
+    app: tauri::AppHandle,
+    id: String,
+    author_note: Option<String>,
+) -> Result<(), String> {
+    let conn = open_db(&app)?;
+    let now = now_ms() as i64;
+    let author_note = author_note
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    tracked_write(&conn, |tx| {
+        tx.execute(
+            "UPDATE sessions SET author_note = ?, updated_at = ? WHERE id = ?",
+            params![author_note, now, id],
+        )
+    })?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn message_toggle_pin(
+    app: tauri::AppHandle,
+    session_id: String,
+    message_id: String,
+) -> Result<Option<String>, String> {
+    let conn = open_db(&app)?;
+    let current: Option<i64> = conn
+        .query_row(
+            "SELECT is_pinned FROM messages WHERE id = ?",
+            params![&message_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    if let Some(is_pinned) = current {
+        tracked_write(&conn, |tx| {
+            tx.execute(
+                "UPDATE messages SET is_pinned = ? WHERE id = ?",
+                params![if is_pinned == 0 { 1 } else { 0 }, &message_id],
+            )
+        })?;
+        if let Some(json) = read_session(&conn, &session_id)? {
+            return Ok(Some(serde_json::to_string(&json).map_err(|e| {
+                crate::utils::err_to_string(module_path!(), line!(), e)
+            })?));
+        }
+        Ok(None)
+    } else {
+        Ok(None)
+    }
+}
+
+#[tauri::command]
+pub fn message_toggle_pin_state(
+    app: tauri::AppHandle,
+    session_id: String,
+    message_id: String,
+) -> Result<Option<bool>, String> {
+    let conn = open_db(&app)?;
+    let now = now_ms() as i64;
+    let current: Option<i64> = conn
+        .query_row(
+            "SELECT is_pinned FROM messages WHERE id = ? AND session_id = ?",
+            params![&message_id, &session_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    if let Some(is_pinned) = current {
+        let next = if is_pinned == 0 { 1 } else { 0 };
+        tracked_write(&conn, |tx| {
+            tx.execute(
+                "UPDATE messages SET is_pinned = ? WHERE id = ? AND session_id = ?",
+                params![next, &message_id, &session_id],
+            )?;
+            tx.execute(
+                "UPDATE sessions SET updated_at = ? WHERE id = ?",
+                params![now, &session_id],
+            )?;
+            Ok(())
+        })?;
+        Ok(Some(next != 0))
+    } else {
+        Ok(None)
+    }
+}
+
+fn session_conversation_anchor(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<(usize, Option<String>), String> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(1) FROM messages WHERE session_id = ?1 AND role IN ('user','assistant')",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    let anchor: Option<String> = conn
+        .query_row(
+            "SELECT id FROM messages WHERE session_id = ?1 AND role IN ('user','assistant') ORDER BY created_at DESC, id DESC LIMIT 1",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    Ok((count.max(0) as usize, anchor))
+}
+
+fn append_session_user_memory_event(
+    conn: &Connection,
+    session_id: &str,
+    action: serde_json::Value,
+) -> Result<(), String> {
+    let (count, anchor) = session_conversation_anchor(conn, session_id)?;
+    let event =
+        crate::conversation_manager::memory::build_user_memory_edit_event(action, count, anchor);
+    let raw: Option<Option<String>> = conn
+        .query_row(
+            "SELECT memory_tool_events FROM sessions WHERE id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    let mut events: Vec<serde_json::Value> = raw
+        .flatten()
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or_default();
+    events.push(event);
+    if events.len() > crate::conversation_manager::memory::MEMORY_TOOL_EVENT_CAP {
+        let excess = events.len() - crate::conversation_manager::memory::MEMORY_TOOL_EVENT_CAP;
+        events.drain(0..excess);
+    }
+    conn.execute(
+        "UPDATE sessions SET memory_tool_events = ?1 WHERE id = ?2",
+        params![
+            serde_json::to_string(&events).map_err(|e| crate::utils::err_to_string(
+                module_path!(),
+                line!(),
+                e
+            ))?,
+            session_id
+        ],
+    )
+    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    Ok(())
+}
+
+fn rewind_session_memory_state(conn: &mut Connection, session_id: &str) -> Result<(), String> {
+    let row: Option<(Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT memory_tool_events, memory_summary FROM sessions WHERE id = ?1",
+            params![session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    let Some((raw_events, prior_summary)) = row else {
+        return Ok(());
+    };
+    let events: Vec<serde_json::Value> = raw_events
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or_default();
+    if events.is_empty() {
+        return Ok(());
+    }
+    let prior_summary = prior_summary.unwrap_or_default();
+    let embeddings = read_session_embeddings_with_fallback(conn, session_id)?;
+    let (remaining_count, _) = session_conversation_anchor(conn, session_id)?;
+
+    let replayed = {
+        let conn_ref: &Connection = conn;
+        crate::conversation_manager::memory::replay_memory_state_after_rewind(
+            &events,
+            &embeddings,
+            &prior_summary,
+            remaining_count,
+            |message_id| {
+                let found: i64 = conn_ref
+                    .query_row(
+                        "SELECT COUNT(1) FROM messages WHERE id = ?1 AND session_id = ?2",
+                        params![message_id, session_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+                Ok(found > 0)
+            },
+        )?
+    };
+
+    let Some(state) = replayed else {
+        return Ok(());
+    };
+
+    write_session_embeddings_through_table(&mut *conn, session_id, &state.embeddings)?;
+    let memories: Vec<String> = state
+        .embeddings
+        .iter()
+        .map(|memory| memory.text.clone())
+        .collect();
+    let memories_json = serde_json::to_string(&memories)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    write_resolved_memories_json(conn, session_id, &memories_json)?;
+    conn.execute(
+        "UPDATE sessions SET memory_tool_events = ?1, memory_summary = ?2,
+                memory_summary_token_count = CASE WHEN ?3 THEN memory_summary_token_count ELSE 0 END,
+                memory_status = 'idle', memory_error = NULL
+         WHERE id = ?4",
+        params![
+            serde_json::to_string(&state.events)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            state.summary,
+            state.summary_unchanged,
+            session_id
+        ],
+    )
+    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn session_add_memory(
+    app: tauri::AppHandle,
+    session_id: String,
+    memory: String,
+    memory_category: Option<String>,
+) -> Result<Option<String>, String> {
+    log_info(
+        &app,
+        "session_add_memory",
+        format!("Adding memory to session {}", session_id),
+    );
+    let mut conn = open_db(&app)?;
+
+    // Read current memories (legacy column) and embeddings (new table or
+    // legacy fallback).
+    let current_memories_json = read_session_memories_json_with_resolution(&conn, &session_id)?;
+
+    let mut memories: Vec<String> =
+        serde_json::from_str(&current_memories_json).unwrap_or_else(|_| vec![]);
+    let mut memory_embeddings = read_session_embeddings_with_fallback(&conn, &session_id)?;
+
+    memories.push(memory.clone());
+
+    // Compute embedding (best-effort)
+    let embedding = match embedding::compute_embedding(app.clone(), memory.clone()).await {
+        Ok(vec) => vec,
+        Err(err) => {
+            log_warn(
+                &app,
+                "session_add_memory",
+                format!("embedding failed: {}", err),
+            );
+            Vec::new()
+        }
+    };
+
+    let token_count = match crate::embedding::tokenizer::count_tokens(&app, &memory) {
+        Ok(count) => count,
+        Err(err) => {
+            log_warn(
+                &app,
+                "session_add_memory",
+                format!("token count failed; defaulting to 0: {}", err),
+            );
+            0
+        }
+    };
+    let category_mode = resolve_memory_category_mode(&conn, &session_id);
+    let normalized_category = normalize_memory_category(memory_category, &category_mode)?;
+    let (embedding_source_version, embedding_dimensions) =
+        match embedding::resolve_active_embedding_signature(&app) {
+            Ok(sig) => sig,
+            Err(err) => {
+                log_warn(
+                    &app,
+                    "session_add_memory",
+                    format!(
+                        "could not resolve active embedding signature; falling back to v3/512 (may mismatch stored vectors): {}",
+                        err
+                    ),
+                );
+                ("v3".to_string(), 512)
+            }
+        };
+
+    let now_u = now_ms();
+    let new_memory_id = uuid::Uuid::new_v4().to_string();
+    let event_category = normalized_category.clone();
+    memory_embeddings.push(MemoryEmbedding {
+        id: new_memory_id.clone(),
+        text: memory.clone(),
+        embedding,
+        created_at: now_u,
+        token_count: token_count as u32,
+        is_cold: false,
+        last_accessed_at: now_u,
+        importance_score: 1.0,
+        persistence_importance: 1.0,
+        prompt_importance: 1.0,
+        volatility: 0.4,
+        is_pinned: false,
+        access_count: 0,
+        embedding_source_version: Some(embedding_source_version),
+        embedding_dimensions: Some(embedding_dimensions),
+        match_score: None,
+        category: normalized_category,
+        observed_at: None,
+        observed_time_precision: None,
+        canonical_entities: Vec::new(),
+        fact_signature: None,
+        fact_polarity: None,
+        source_role: None,
+        source_message_id: None,
+        superseded_by: None,
+        superseded_at: None,
+        supersedes: Vec::new(),
+    });
+
+    // Save back: embeddings via new table, memories + updated_at via legacy.
+    write_session_embeddings_through_table(&mut *conn, &session_id, &memory_embeddings)?;
+    let new_memories_json = serde_json::to_string(&memories)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    write_resolved_memories_json(&conn, &session_id, &new_memories_json)?;
+    append_session_user_memory_event(
+        &conn,
+        &session_id,
+        serde_json::json!({
+            "name": "create_memory",
+            "memoryId": new_memory_id,
+            "timestamp": now_u,
+            "arguments": { "text": memory, "category": event_category, "important": false },
+        }),
+    )?;
+
+    if let Some(json) = read_session_meta(&conn, &session_id)? {
+        return Ok(Some(serde_json::to_string(&json).map_err(|e| {
+            crate::utils::err_to_string(module_path!(), line!(), e)
+        })?));
+    }
+    Ok(None)
+}
+
+#[tauri::command]
+pub fn session_remove_memory(
+    app: tauri::AppHandle,
+    session_id: String,
+    memory_index: usize,
+) -> Result<Option<String>, String> {
+    let mut conn = open_db(&app)?;
+
+    let current_memories_json = read_session_memories_json_with_resolution(&conn, &session_id)?;
+
+    let mut memories: Vec<String> =
+        serde_json::from_str(&current_memories_json).unwrap_or_else(|_| vec![]);
+    let mut memory_embeddings = read_session_embeddings_with_fallback(&conn, &session_id)?;
+
+    if memory_index < memories.len() {
+        let removed_text = memories.remove(memory_index);
+        let removed_embedding = if memory_index < memory_embeddings.len() {
+            Some(memory_embeddings.remove(memory_index))
+        } else {
+            None
+        };
+        write_session_embeddings_through_table(&mut *conn, &session_id, &memory_embeddings)?;
+        let new_memories_json = serde_json::to_string(&memories)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+        write_resolved_memories_json(&conn, &session_id, &new_memories_json)?;
+        if let Some(removed) = removed_embedding {
+            append_session_user_memory_event(
+                &conn,
+                &session_id,
+                serde_json::json!({
+                    "name": "delete_memory",
+                    "deletedMemoryId": removed.id,
+                    "softDelete": false,
+                    "memorySnapshot": serde_json::to_value(&removed)
+                        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+                    "timestamp": now_ms(),
+                    "arguments": { "text": removed_text },
+                }),
+            )?;
+        }
+    }
+
+    if let Some(json) = read_session_meta(&conn, &session_id)? {
+        return Ok(Some(serde_json::to_string(&json).map_err(|e| {
+            crate::utils::err_to_string(module_path!(), line!(), e)
+        })?));
+    }
+    Ok(None)
+}
+
+#[tauri::command]
+pub async fn session_update_memory(
+    app: tauri::AppHandle,
+    session_id: String,
+    memory_index: usize,
+    new_memory: String,
+    new_category: Option<String>,
+) -> Result<Option<String>, String> {
+    let mut conn = open_db(&app)?;
+
+    let current_memories_json = read_session_memories_json_with_resolution(&conn, &session_id)?;
+
+    let mut memories: Vec<String> =
+        serde_json::from_str(&current_memories_json).unwrap_or_else(|_| vec![]);
+    let mut memory_embeddings = read_session_embeddings_with_fallback(&conn, &session_id)?;
+
+    if memory_index < memories.len() {
+        let previous_text = memories[memory_index].clone();
+        let previous_category = memory_embeddings
+            .get(memory_index)
+            .and_then(|m| m.category.clone());
+        memories[memory_index] = new_memory.clone();
+        let category_mode = resolve_memory_category_mode(&conn, &session_id);
+        let normalized_category = normalize_memory_category(new_category, &category_mode)?;
+        let event_category = normalized_category.clone();
+
+        let embedding = match embedding::compute_embedding(app.clone(), new_memory.clone()).await {
+            Ok(vec) => vec,
+            Err(err) => {
+                log_error(
+                    &app,
+                    "session_update_memory",
+                    format!("embedding failed: {}", err),
+                );
+                Vec::new()
+            }
+        };
+        let (embedding_source_version, embedding_dimensions) =
+            embedding::resolve_active_embedding_signature(&app)
+                .unwrap_or_else(|_| ("v3".to_string(), 512));
+
+        let now_u = now_ms();
+        let edited_existing = memory_index < memory_embeddings.len();
+        let edited_memory_id = if edited_existing {
+            memory_embeddings[memory_index].id.clone()
+        } else {
+            uuid::Uuid::new_v4().to_string()
+        };
+        if edited_existing {
+            let m = &mut memory_embeddings[memory_index];
+            m.text = memories[memory_index].clone();
+            m.embedding = embedding;
+            m.embedding_source_version = Some(embedding_source_version);
+            m.embedding_dimensions = Some(embedding_dimensions);
+            m.category = normalized_category;
+        } else {
+            memory_embeddings.push(MemoryEmbedding {
+                id: edited_memory_id.clone(),
+                text: memories[memory_index].clone(),
+                embedding,
+                created_at: now_u,
+                token_count: 0,
+                is_cold: false,
+                last_accessed_at: now_u,
+                importance_score: 1.0,
+                persistence_importance: 1.0,
+                prompt_importance: 1.0,
+                volatility: 0.4,
+                is_pinned: false,
+                access_count: 0,
+                embedding_source_version: Some(embedding_source_version),
+                embedding_dimensions: Some(embedding_dimensions),
+                match_score: None,
+                category: normalized_category,
+                observed_at: None,
+                observed_time_precision: None,
+                canonical_entities: Vec::new(),
+                fact_signature: None,
+                fact_polarity: None,
+                source_role: None,
+                source_message_id: None,
+                superseded_by: None,
+                superseded_at: None,
+                supersedes: Vec::new(),
+            });
+        }
+
+        write_session_embeddings_through_table(&mut *conn, &session_id, &memory_embeddings)?;
+        let new_memories_json = serde_json::to_string(&memories)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+        write_resolved_memories_json(&conn, &session_id, &new_memories_json)?;
+        let action = if edited_existing {
+            serde_json::json!({
+                "name": "update_memory",
+                "memoryId": edited_memory_id,
+                "previousText": previous_text,
+                "previousCategory": previous_category,
+                "timestamp": now_u,
+                "arguments": { "text": new_memory, "category": event_category },
+            })
+        } else {
+            serde_json::json!({
+                "name": "create_memory",
+                "memoryId": edited_memory_id,
+                "timestamp": now_u,
+                "arguments": { "text": new_memory, "category": event_category, "important": false },
+            })
+        };
+        append_session_user_memory_event(&conn, &session_id, action)?;
+    }
+
+    if let Some(json) = read_session_meta(&conn, &session_id)? {
+        return Ok(Some(serde_json::to_string(&json).map_err(|e| {
+            crate::utils::err_to_string(module_path!(), line!(), e)
+        })?));
+    }
+    Ok(None)
+}
+
+#[tauri::command]
+pub fn session_toggle_memory_pin(
+    app: tauri::AppHandle,
+    session_id: String,
+    memory_index: usize,
+) -> Result<Option<String>, String> {
+    let mut conn = open_db(&app)?;
+
+    let mut memory_embeddings = read_session_embeddings_with_fallback(&conn, &session_id)?;
+    let now = now_ms();
+
+    if memory_index < memory_embeddings.len() {
+        let (memory_id, previous_pinned, next_pinned) = {
+            let m = &mut memory_embeddings[memory_index];
+            let previous_pinned = m.is_pinned;
+            let next_pinned = !m.is_pinned;
+            m.is_pinned = next_pinned;
+            if next_pinned {
+                m.is_cold = false;
+                m.importance_score = 1.0;
+                m.last_accessed_at = now;
+            }
+            (m.id.clone(), previous_pinned, next_pinned)
+        };
+        write_session_embeddings_through_table(&mut *conn, &session_id, &memory_embeddings)?;
+        append_session_user_memory_event(
+            &conn,
+            &session_id,
+            serde_json::json!({
+                "name": if next_pinned { "pin_memory" } else { "unpin_memory" },
+                "memoryId": memory_id,
+                "previousPinned": previous_pinned,
+                "timestamp": now,
+                "arguments": { "id": memory_id },
+            }),
+        )?;
+    }
+
+    if let Some(json) = read_session_meta(&conn, &session_id)? {
+        return Ok(Some(serde_json::to_string(&json).map_err(|e| {
+            crate::utils::err_to_string(module_path!(), line!(), e)
+        })?));
+    }
+    Ok(None)
+}
+
+#[tauri::command]
+pub fn session_set_memory_cold_state(
+    app: tauri::AppHandle,
+    session_id: String,
+    memory_index: usize,
+    is_cold: bool,
+) -> Result<Option<String>, String> {
+    let mut conn = open_db(&app)?;
+
+    let memories_json = read_session_memories_json_with_resolution(&conn, &session_id)?;
+    let memories: Vec<String> = serde_json::from_str(&memories_json).unwrap_or_default();
+    let mut memory_embeddings = read_session_embeddings_with_fallback(&conn, &session_id)?;
+
+    if memory_index >= memories.len() {
+        if let Some(json) = read_session_meta(&conn, &session_id)? {
+            return Ok(Some(serde_json::to_string(&json).map_err(|e| {
+                crate::utils::err_to_string(module_path!(), line!(), e)
+            })?));
+        }
+        return Ok(None);
+    }
+
+    let now_u = now_ms();
+
+    // Ensure embeddings vector is long enough; fill missing entries with placeholders.
+    while memory_embeddings.len() <= memory_index {
+        let idx = memory_embeddings.len();
+        let text = memories.get(idx).cloned().unwrap_or_default();
+        memory_embeddings.push(MemoryEmbedding {
+            id: uuid::Uuid::new_v4().to_string(),
+            text,
+            embedding: Vec::new(),
+            created_at: now_u,
+            token_count: 0,
+            is_cold: false,
+            last_accessed_at: now_u,
+            importance_score: 1.0,
+            persistence_importance: 1.0,
+            prompt_importance: 1.0,
+            volatility: 0.4,
+            is_pinned: false,
+            access_count: 0,
+            embedding_source_version: None,
+            embedding_dimensions: None,
+            match_score: None,
+            category: None,
+            observed_at: None,
+            observed_time_precision: None,
+            canonical_entities: Vec::new(),
+            fact_signature: None,
+            fact_polarity: None,
+            source_role: None,
+            source_message_id: None,
+            superseded_by: None,
+            superseded_at: None,
+            supersedes: Vec::new(),
+        });
+    }
+
+    let (memory_id, previous_is_cold) = {
+        let m = &mut memory_embeddings[memory_index];
+        if m.is_pinned && is_cold {
+            return Err(crate::utils::err_msg(
+                module_path!(),
+                line!(),
+                "Pinned memories cannot be moved to cold storage",
+            ));
+        }
+        let previous_is_cold = m.is_cold;
+        m.is_cold = is_cold;
+        if is_cold {
+            m.importance_score = 0.0;
+        } else {
+            m.importance_score = 1.0;
+            m.last_accessed_at = now_u;
+        }
+        (m.id.clone(), previous_is_cold)
+    };
+
+    write_session_embeddings_through_table(&mut *conn, &session_id, &memory_embeddings)?;
+    append_session_user_memory_event(
+        &conn,
+        &session_id,
+        serde_json::json!({
+            "name": "set_memory_cold",
+            "memoryId": memory_id,
+            "previousIsCold": previous_is_cold,
+            "timestamp": now_u,
+            "arguments": { "isCold": is_cold },
+        }),
+    )?;
+
+    if let Some(json) = read_session_meta(&conn, &session_id)? {
+        return Ok(Some(serde_json::to_string(&json).map_err(|e| {
+            crate::utils::err_to_string(module_path!(), line!(), e)
+        })?));
+    }
+    Ok(None)
+}
+
+#[tauri::command]
+pub fn session_set_memory_observed_at(
+    app: tauri::AppHandle,
+    session_id: String,
+    memory_index: usize,
+    observed_at: Option<u64>,
+) -> Result<Option<String>, String> {
+    let mut conn = open_db(&app)?;
+
+    let memories_json = read_session_memories_json_with_resolution(&conn, &session_id)?;
+    let memories: Vec<String> = serde_json::from_str(&memories_json).unwrap_or_default();
+    let mut memory_embeddings = read_session_embeddings_with_fallback(&conn, &session_id)?;
+
+    if memory_index >= memories.len() {
+        if let Some(json) = read_session_meta(&conn, &session_id)? {
+            return Ok(Some(serde_json::to_string(&json).map_err(|e| {
+                crate::utils::err_to_string(module_path!(), line!(), e)
+            })?));
+        }
+        return Ok(None);
+    }
+
+    let now_u = now_ms();
+
+    while memory_embeddings.len() <= memory_index {
+        let idx = memory_embeddings.len();
+        let text = memories.get(idx).cloned().unwrap_or_default();
+        memory_embeddings.push(MemoryEmbedding {
+            id: uuid::Uuid::new_v4().to_string(),
+            text,
+            embedding: Vec::new(),
+            created_at: now_u,
+            token_count: 0,
+            is_cold: false,
+            last_accessed_at: now_u,
+            importance_score: 1.0,
+            persistence_importance: 1.0,
+            prompt_importance: 1.0,
+            volatility: 0.4,
+            is_pinned: false,
+            access_count: 0,
+            embedding_source_version: None,
+            embedding_dimensions: None,
+            match_score: None,
+            category: None,
+            observed_at: None,
+            observed_time_precision: None,
+            canonical_entities: Vec::new(),
+            fact_signature: None,
+            fact_polarity: None,
+            source_role: None,
+            source_message_id: None,
+            superseded_by: None,
+            superseded_at: None,
+            supersedes: Vec::new(),
+        });
+    }
+
+    let (memory_id, previous_observed_at, previous_precision) = {
+        let m = &mut memory_embeddings[memory_index];
+        let previous_observed_at = m.observed_at;
+        let previous_precision = m.observed_time_precision.clone();
+        m.observed_at = observed_at;
+        m.observed_time_precision = observed_at.map(|_| "user".to_string());
+        (m.id.clone(), previous_observed_at, previous_precision)
+    };
+
+    write_session_embeddings_through_table(&mut *conn, &session_id, &memory_embeddings)?;
+    append_session_user_memory_event(
+        &conn,
+        &session_id,
+        serde_json::json!({
+            "name": "set_memory_observed_at",
+            "memoryId": memory_id,
+            "previousObservedAt": previous_observed_at,
+            "previousObservedTimePrecision": previous_precision,
+            "timestamp": now_u,
+            "arguments": { "observedAt": observed_at },
+        }),
+    )?;
+
+    if let Some(json) = read_session_meta(&conn, &session_id)? {
+        return Ok(Some(serde_json::to_string(&json).map_err(|e| {
+            crate::utils::err_to_string(module_path!(), line!(), e)
+        })?));
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
+mod effective_message_time_tests {
+    use super::resolved_message_effective_at;
+    use rusqlite::{params, Connection};
+    use serde_json::json;
+
+    #[test]
+    fn legacy_conversation_messages_fall_back_to_created_time() {
+        assert_eq!(
+            resolved_message_effective_at(&json!({}), "user", 1_234),
+            Some(1_234)
+        );
+        assert_eq!(
+            resolved_message_effective_at(&json!({}), "assistant", 2_345),
+            Some(2_345)
+        );
+        assert_eq!(
+            resolved_message_effective_at(&json!({}), "scene", 3_456),
+            None
+        );
+    }
+
+    #[test]
+    fn supplied_effective_time_wins_over_created_time() {
+        assert_eq!(
+            resolved_message_effective_at(&json!({ "effectiveAt": 9_876 }), "user", 1_234),
+            Some(9_876)
+        );
+    }
+
+    #[test]
+    fn upsert_keeps_an_existing_effective_time() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (id TEXT PRIMARY KEY, effective_at INTEGER);
+             INSERT INTO messages (id, effective_at) VALUES ('message', 100);",
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO messages (id, effective_at) VALUES (?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET
+               effective_at = COALESCE(messages.effective_at, excluded.effective_at)",
+            params!["message", 200],
+        )
+        .unwrap();
+
+        let effective_at = conn
+            .query_row(
+                "SELECT effective_at FROM messages WHERE id = 'message'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(effective_at, 100);
+    }
+}
+
+#[cfg(test)]
+mod shared_memory_session_creation_tests {
+    use super::persist_shared_memory_from_session_json;
+    use rusqlite::{params, Connection};
+
+    fn connection() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE characters (
+               id TEXT PRIMARY KEY,
+               mode TEXT,
+               companion TEXT
+             );
+             CREATE TABLE sessions (
+               id TEXT PRIMARY KEY,
+               character_id TEXT NOT NULL,
+               mode TEXT NOT NULL
+             );
+             CREATE TABLE companion_shared_memory_state (
+               character_id TEXT PRIMARY KEY,
+               memories TEXT NOT NULL DEFAULT '[]',
+               memory_summary TEXT,
+               memory_summary_token_count INTEGER NOT NULL DEFAULT 0,
+               memory_tool_events TEXT NOT NULL DEFAULT '[]',
+               memory_status TEXT,
+               memory_error TEXT,
+               memory_progress_step INTEGER,
+               soul_growth TEXT NOT NULL DEFAULT '[]',
+               relationship_states TEXT NOT NULL DEFAULT '{}',
+               created_at INTEGER NOT NULL,
+               updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE memory_embeddings (
+               session_id TEXT NOT NULL,
+               session_kind TEXT NOT NULL,
+               memory_id TEXT NOT NULL
+             );
+             INSERT INTO characters (id, mode, companion) VALUES (
+               'character',
+               'companion',
+               '{\"memory\":{\"sharedAcrossSessions\":true}}'
+             );
+             INSERT INTO companion_shared_memory_state (
+               character_id, memories, memory_summary, memory_summary_token_count,
+               memory_tool_events, memory_status, soul_growth, relationship_states,
+               created_at, updated_at
+             ) VALUES (
+               'character', '[\"Remember this\"]', 'Existing summary', 2,
+               '[{\"name\":\"add_memory\"}]', 'idle', '[]', '{}', 1, 1
+             );
+             INSERT INTO memory_embeddings VALUES (
+               'character', 'companion_shared', 'memory-1'
+             );",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn creating_another_session_does_not_clear_character_memory() {
+        let conn = connection();
+
+        let shared = persist_shared_memory_from_session_json(
+            &conn,
+            "new-session",
+            "character",
+            "companion",
+            "[]",
+            "[]",
+            None,
+            0,
+            "[]",
+            Some("idle".to_string()),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(shared);
+        let state = conn
+            .query_row(
+                "SELECT memories, memory_summary, memory_tool_events
+                 FROM companion_shared_memory_state WHERE character_id = 'character'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(state.0, "[\"Remember this\"]");
+        assert_eq!(state.1.as_deref(), Some("Existing summary"));
+        assert_eq!(state.2, "[{\"name\":\"add_memory\"}]");
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM memory_embeddings
+                 WHERE session_id = ?1 AND session_kind = 'companion_shared'",
+                params!["character"],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+    }
+}

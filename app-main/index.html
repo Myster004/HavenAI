@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no" />
+    <title>MYnestAI</title>
+    <script>
+      (function () {
+        try {
+          var ua = navigator.userAgent;
+          if (!/Linux/.test(ua) || /Android/.test(ua)) return;
+          var corners = localStorage.getItem("lettuce.windowCorners") || "medium";
+          var design = localStorage.getItem("lettuce.titleBarDesign");
+          var radii = { small: "8px", medium: "12px", large: "16px" };
+          if (radii[corners] && design !== "native") {
+            document.documentElement.classList.add("window-rounded");
+            document.documentElement.style.setProperty("--window-radius", radii[corners]);
+          }
+        } catch (e) {}
+      })();
+    </script>
+  </head>
+
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

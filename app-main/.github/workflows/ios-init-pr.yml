@@ -1,0 +1,66 @@
+name: Maintenance / iOS Init PR
+
+run-name: iOS init PR by @${{ github.actor }}
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ios-init-pr-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  init-ios:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "lts/*"
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "latest"
+
+      - name: Install Rust
+        uses: ./.github/actions/setup-rust-build
+        with:
+          cache-key: ios-init
+
+      - name: Ensure iOS toolchain deps
+        run: |
+          xcode-select -p
+          if ! command -v pod >/dev/null 2>&1; then
+            sudo gem install cocoapods
+          fi
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Init iOS project
+        run: bun run tauri ios init
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore: initialize iOS project files"
+          title: "chore: initialize iOS project files"
+          body: |
+            This PR was created automatically by the `iOS Init + PR` workflow.
+
+            Changes include generated iOS project files from:
+            - `bun run tauri ios init`
+          branch: chore/ios-init
+          delete-branch: true

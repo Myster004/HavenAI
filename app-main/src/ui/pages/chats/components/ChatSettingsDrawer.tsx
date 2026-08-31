@@ -1,0 +1,77 @@
+import { useEffect } from "react";
+import { motion, AnimatePresence } from "framer-motion";
+import type { Character } from "../../../../core/storage/schemas";
+import { ChatSettingsContent } from "../ChatSettings";
+import { useI18n } from "../../../../core/i18n/context";
+
+interface ChatSettingsDrawerProps {
+  isOpen: boolean;
+  onClose: () => void;
+  character: Character;
+  onOpenAuthorNote?: () => void;
+}
+
+export function ChatSettingsDrawer({
+  isOpen,
+  onClose,
+  character,
+  onOpenAuthorNote,
+}: ChatSettingsDrawerProps) {
+  const { t } = useI18n();
+  // Close on Escape
+  useEffect(() => {
+    if (!isOpen) return;
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [isOpen, onClose]);
+
+  return (
+    <AnimatePresence>
+      {isOpen && (
+        <>
+          {/* Backdrop */}
+          <motion.div
+            className="fixed inset-0 z-40 bg-black/50"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.2 }}
+            onClick={onClose}
+          />
+
+          {/* Drawer panel */}
+          <motion.aside
+            className="fixed bottom-0 right-0 top-[var(--titlebar-h,0px)] z-50 flex w-[640px] max-w-[90vw] flex-col border-l border-fg/10 bg-surface shadow-2xl"
+            initial={{ x: "100%" }}
+            animate={{ x: 0 }}
+            exit={{ x: "100%" }}
+            transition={{ type: "spring", damping: 28, stiffness: 320 }}
+          >
+            {/* Drawer header */}
+            <div className="flex shrink-0 items-center justify-between border-b border-fg/10 px-4 py-3">
+              <div>
+                <p className="text-base font-bold text-fg">{t("chats.drawer.chatSettingsTitle")}</p>
+                <p className="text-xs text-fg/50">{t("chats.drawer.chatSettingsSubtitle")}</p>
+              </div>
+              <div className="flex items-center gap-1">
+              </div>
+            </div>
+
+            {/* Settings content */}
+            <div className="flex-1 overflow-hidden">
+              <ChatSettingsContent
+                character={character}
+                mode="drawer"
+                onClose={onClose}
+                onOpenAuthorNote={onOpenAuthorNote}
+              />
+            </div>
+          </motion.aside>
+        </>
+      )}
+    </AnimatePresence>
+  );
+}

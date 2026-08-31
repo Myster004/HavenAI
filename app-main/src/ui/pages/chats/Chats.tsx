@@ -1,0 +1,1263 @@
+import { useCallback, useEffect, useMemo, useState, memo, useRef } from "react";
+import {
+  Edit2,
+  Trash2,
+  Download,
+  EyeOff,
+  Paintbrush,
+  Upload,
+  Settings,
+  SearchX,
+  LayoutGrid,
+  LayoutList,
+  Grid3X3,
+} from "lucide-react";
+import { useNavigate } from "react-router-dom";
+import { motion, AnimatePresence } from "framer-motion";
+import { listen, UnlistenFn } from "@tauri-apps/api/event";
+
+import {
+  listCharacters,
+  createSession,
+  listSessionPreviews,
+  archiveSession,
+  SESSION_UPDATED_EVENT,
+  deleteCharacter,
+} from "../../../core/storage/repo";
+import type { Character, ChatsViewMode } from "../../../core/storage/schemas";
+import { typography, radius, spacing, interactive, cn } from "../../design-tokens";
+import { BottomMenu, CharacterExportMenu } from "../../components";
+import {
+  PageHeader,
+  PageHeaderAction,
+  useInlineHeader,
+  useRailSettings,
+} from "../../components/App";
+import { AvatarImage } from "../../components/AvatarImage";
+import { useAvatar } from "../../hooks/useAvatar";
+import { useAvatarGradient } from "../../hooks/useAvatarGradient";
+import {
+  getChatsViewMode,
+  getChatsViewModeCached,
+  setChatsViewMode,
+} from "../../../core/storage/appState";
+import {
+  exportCharacterWithFormat,
+  downloadJson,
+  generateExportFilenameWithFormat,
+  type CharacterFileFormat,
+} from "../../../core/storage/characterTransfer";
+import { storageBridge } from "../../../core/storage/files";
+import { ChatTemplateSelector } from "./components/ChatTemplateSelector";
+import { BannerCharacterCard } from "./components/BannerCharacterCard";
+import { CircleCharacterCard } from "./components/CircleCharacterCard";
+import { useI18n } from "../../../core/i18n/context";
+import { isRenderableImageUrl } from "../../../core/utils/image";
+import { cleanupOldDrafts } from "./utils/draftCleanup";
+
+export function ChatPage() {
+  const [characters, setCharacters] = useState<Character[]>(() => chatsPageCache?.characters ?? []);
+  const [loading, setLoading] = useState(() => !chatsPageCache);
+  const [selectedCharacter, setSelectedCharacter] = useState<Character | null>(null);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const [exportMenuOpen, setExportMenuOpen] = useState(false);
+  const [exportTarget, setExportTarget] = useState<Character | null>(null);
+  const [, setImportingChatpkg] = useState(false);
+  const [latestSessionByCharacter, setLatestSessionByCharacter] = useState<
+    Record<string, { id: string; updatedAt: number; archived: boolean }>
+  >(() => chatsPageCache?.latestSessionByCharacter ?? {});
+  const [hiding, setHiding] = useState(false);
+  const [viewMode, setViewMode] = useState<ChatsViewMode>(
+    () => getChatsViewModeCached() ?? "hero",
+  );
+  const [templateSelectorCharacter, setTemplateSelectorCharacter] = useState<Character | null>(
+    null,
+  );
+  const [query, setQuery] = useState("");
+  const navigate = useNavigate();
+  const { t } = useI18n();
+  const inlineHeader = useInlineHeader();
+  const railSettings = useRailSettings();
+
+  const visibleCharacters = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    if (!needle) return characters;
+    return characters.filter(
+      (character) =>
+        character.name.toLowerCase().includes(needle) ||
+        (character.description ?? "").toLowerCase().includes(needle),
+    );
+  }, [characters, query]);
+
+  const cycleViewMode = useCallback(() => {
+    setViewMode((prev) => {
+      const modes: ChatsViewMode[] = ["hero", "gallery", "list"];
+      const next = modes[(modes.indexOf(prev) + 1) % modes.length];
+      setChatsViewMode(next).catch(() => {});
+      return next;
+    });
+  }, []);
+
+  const ChatsLayoutIcon =
+    viewMode === "hero" ? LayoutGrid : viewMode === "gallery" ? Grid3X3 : LayoutList;
+
+  useEffect(() => {
+    getChatsViewMode()
+      .then((mode) => {
+        setViewMode(mode);
+        (window as any).__chatsViewMode = mode;
+        window.dispatchEvent(new CustomEvent("chats:viewModeChanged"));
+      })
+      .catch(() => {});
+  }, []);
+
+  // Sync window global whenever viewMode changes
+  useEffect(() => {
+    (window as any).__chatsViewMode = viewMode;
+    window.dispatchEvent(new CustomEvent("chats:viewModeChanged"));
+  }, [viewMode]);
+
+  // Listen for cycle event from TopNav
+  useEffect(() => {
+    const handler = () => cycleViewMode();
+    window.addEventListener("chats:cycleViewMode", handler);
+    return () => window.removeEventListener("chats:cycleViewMode", handler);
+  }, [cycleViewMode]);
+
+  useEffect(() => {
+    cleanupOldDrafts();
+  }, []);
+
+  const loadCharacters = async () => {
+    try {
+      const [list, previews] = await Promise.all([
+        listCharacters(),
+        listSessionPreviews().catch(() => []),
+      ]);
+      const latestByCharacter: Record<
+        string,
+        { id: string; updatedAt: number; archived: boolean }
+      > = {};
+      const charactersWithSessions = new Set<string>();
+
+      previews.forEach((preview) => {
+        charactersWithSessions.add(preview.characterId);
+        const current = latestByCharacter[preview.characterId];
+        if (!current || preview.updatedAt > current.updatedAt) {
+          latestByCharacter[preview.characterId] = {
+            id: preview.id,
+            updatedAt: preview.updatedAt,
+            archived: preview.archived,
+          };
+        }
+      });
+
+      const visible = list.filter((character) => {
+        if (!charactersWithSessions.has(character.id)) return true;
+        return !latestByCharacter[character.id]?.archived;
+      });
+
+      const sorted = [...visible].sort((a, b) => {
+        const aTime = latestByCharacter[a.id]?.updatedAt ?? a.updatedAt ?? a.createdAt ?? 0;
+        const bTime = latestByCharacter[b.id]?.updatedAt ?? b.updatedAt ?? b.createdAt ?? 0;
+        return bTime - aTime;
+      });
+
+      chatsPageCache = {
+        characters: sorted,
+        latestSessionByCharacter: latestByCharacter,
+      };
+      setLatestSessionByCharacter(latestByCharacter);
+      setCharacters(sorted);
+    } catch (err) {
+      console.error("Failed to load characters:", err);
+    }
+  };
+
+  useEffect(() => {
+    (async () => {
+      try {
+        await loadCharacters();
+      } finally {
+        setLoading(false);
+      }
+    })();
+
+    // Listen for database reload events to refresh data
+    let unlisten: UnlistenFn | null = null;
+    (async () => {
+      unlisten = await listen("database-reloaded", () => {
+        console.log("Database reloaded, refreshing characters...");
+        loadCharacters();
+      });
+    })();
+
+    const handleSessionUpdated = () => {
+      loadCharacters();
+    };
+    window.addEventListener(SESSION_UPDATED_EVENT, handleSessionUpdated);
+
+    return () => {
+      if (unlisten) unlisten();
+      window.removeEventListener(SESSION_UPDATED_EVENT, handleSessionUpdated);
+    };
+  }, []);
+
+  const createNewChat = async (character: Character, templateId?: string | null) => {
+    try {
+      const session = await createSession(
+        character.id,
+        "New Chat",
+        undefined,
+        templateId ?? undefined,
+      );
+      navigate(`/chat/${character.id}?sessionId=${session.id}`);
+    } catch (error) {
+      console.error("Failed to create session:", error);
+      navigate(`/chat/${character.id}`);
+    }
+  };
+
+  const startChat = async (character: Character) => {
+    try {
+      const previews = await listSessionPreviews(character.id, 1).catch(() => []);
+      const latestSessionId = previews[0]?.id ?? latestSessionByCharacter[character.id]?.id;
+      if (latestSessionId) {
+        navigate(`/chat/${character.id}?sessionId=${latestSessionId}`);
+        return;
+      }
+
+      // If character has templates, show selector
+      if (character.chatTemplates && character.chatTemplates.length > 0) {
+        setTemplateSelectorCharacter(character);
+        return;
+      }
+
+      await createNewChat(character);
+    } catch (error) {
+      console.error("Failed to load or create session:", error);
+      navigate(`/chat/${character.id}`);
+    }
+  };
+
+  const handleEditCharacter = (character: Character) => {
+    navigate(`/settings/characters/${character.id}/edit`);
+  };
+
+  const handleDelete = async () => {
+    if (!selectedCharacter) return;
+
+    try {
+      setDeleting(true);
+      await deleteCharacter(selectedCharacter.id);
+      await loadCharacters();
+      setShowDeleteConfirm(false);
+      setSelectedCharacter(null);
+    } catch (err) {
+      console.error("Failed to delete character:", err);
+    } finally {
+      setDeleting(false);
+    }
+  };
+
+  const handleExport = () => {
+    if (!selectedCharacter) return;
+    setExportTarget(selectedCharacter);
+    setSelectedCharacter(null);
+    setExportMenuOpen(true);
+  };
+
+  const openImportChatpkg = async (character: Character) => {
+    try {
+      const picked = await storageBridge.jsonlPickFile();
+      if (!picked) return;
+      setSelectedCharacter(null);
+      setImportingChatpkg(true);
+      const result = await storageBridge.jsonlImport(picked.path, {
+        targetCharacterId: character.id,
+      });
+      const importedSessionId = result?.sessionId;
+      if (typeof importedSessionId === "string" && importedSessionId.length > 0) {
+        navigate(`/chat/${character.id}?sessionId=${encodeURIComponent(importedSessionId)}`);
+      }
+    } catch (err) {
+      console.error("Failed to import chat:", err);
+      alert(typeof err === "string" ? err : "Failed to import chat");
+    } finally {
+      setImportingChatpkg(false);
+    }
+  };
+
+  const handleHide = async () => {
+    if (!selectedCharacter) return;
+    const latestSessionId = latestSessionByCharacter[selectedCharacter.id]?.id;
+    if (!latestSessionId) {
+      setSelectedCharacter(null);
+      return;
+    }
+
+    try {
+      setHiding(true);
+      await archiveSession(latestSessionId, true);
+      await loadCharacters();
+      setSelectedCharacter(null);
+    } catch (err) {
+      console.error("Failed to hide character session:", err);
+    } finally {
+      setHiding(false);
+    }
+  };
+
+  const handleExportFormat = async (format: CharacterFileFormat) => {
+    if (!exportTarget) return;
+
+    try {
+      setExporting(true);
+      const exportJson = await exportCharacterWithFormat(exportTarget.id, format);
+      const filename = generateExportFilenameWithFormat(exportTarget.name, format);
+      await downloadJson(exportJson, filename);
+    } catch (err) {
+      console.error("Failed to export character:", err);
+    } finally {
+      setExporting(false);
+      setExportMenuOpen(false);
+      setExportTarget(null);
+    }
+  };
+
+  return (
+    <div className="flex h-full flex-col pb-6 text-gray-200">
+      <main className="flex-1 overflow-y-auto px-1 lg:px-8 pt-4 mx-auto w-full max-w-md lg:max-w-[1600px]">
+        {inlineHeader && (
+          <PageHeader
+            title={t("common.nav.chats")}
+            meta={
+              query.trim()
+                ? t("pageHeader.results", {
+                    count: String(visibleCharacters.length),
+                    total: String(characters.length),
+                  })
+                : undefined
+            }
+            searchValue={query}
+            onSearchChange={setQuery}
+            searchPlaceholder={t("pageHeader.searchChats")}
+            actions={
+              <>
+                <PageHeaderAction
+                  icon={ChatsLayoutIcon}
+                  label={t("topNav.changeLayout")}
+                  onClick={cycleViewMode}
+                />
+                {!railSettings && (
+                  <PageHeaderAction
+                    icon={Settings}
+                    label={t("topNav.settings")}
+                    onClick={() => navigate("/settings")}
+                    dataTourId="top-settings"
+                  />
+                )}
+              </>
+            }
+          />
+        )}
+        {loading ? (
+          <CharacterSkeleton />
+        ) : visibleCharacters.length ? (
+          <CharacterList
+            characters={visibleCharacters}
+            viewMode={viewMode}
+            onSelect={startChat}
+            onLongPress={setSelectedCharacter}
+          />
+        ) : characters.length ? (
+          <NoResultsState query={query} />
+        ) : (
+          <EmptyState />
+        )}
+      </main>
+
+      {/* Character Actions Menu */}
+      <BottomMenu
+        isOpen={Boolean(selectedCharacter)}
+        onClose={() => setSelectedCharacter(null)}
+        includeExitIcon={false}
+        title={selectedCharacter?.name || ""}
+      >
+        {selectedCharacter && (
+          <div className="space-y-2">
+            <button
+              onClick={() => handleEditCharacter(selectedCharacter)}
+              className="flex w-full items-center gap-3 rounded-xl border border-white/10 bg-white/5 px-4 py-3 text-left transition hover:border-white/20 hover:bg-white/10"
+            >
+              <div className="flex h-8 w-8 items-center justify-center rounded-full border border-white/10 bg-white/10">
+                <Edit2 className="h-4 w-4 text-white/70" />
+              </div>
+              <span className="text-sm font-medium text-white">{t("chats.editCharacter")}</span>
+            </button>
+
+            <button
+              onClick={handleExport}
+              disabled={exporting}
+              className="flex w-full items-center gap-3 rounded-xl border border-blue-400/30 bg-blue-400/10 px-4 py-3 text-left transition hover:border-blue-400/50 hover:bg-blue-400/20 disabled:opacity-50"
+            >
+              <div className="flex h-8 w-8 items-center justify-center rounded-full border border-blue-400/30 bg-blue-400/20">
+                <Download className="h-4 w-4 text-blue-400" />
+              </div>
+              <span className="text-sm font-medium text-blue-300">
+                {exporting ? t("common.buttons.exporting") : t("chats.exportCharacter")}
+              </span>
+            </button>
+
+            <button
+              onClick={() => {
+                const charId = selectedCharacter.id;
+                setSelectedCharacter(null);
+                navigate(`/settings/customization/chat?characterId=${charId}`);
+              }}
+              className="flex w-full items-center gap-3 rounded-xl border border-purple-400/30 bg-purple-400/10 px-4 py-3 text-left transition hover:border-purple-400/50 hover:bg-purple-400/20"
+            >
+              <div className="flex h-8 w-8 items-center justify-center rounded-full border border-purple-400/30 bg-purple-400/20">
+                <Paintbrush className="h-4 w-4 text-purple-400" />
+              </div>
+              <span className="text-sm font-medium text-purple-300">
+                {t("chats.chatAppearance")}
+              </span>
+            </button>
+
+            <button
+              onClick={() => {
+                void openImportChatpkg(selectedCharacter);
+              }}
+              className="flex w-full items-center gap-3 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-left transition hover:border-emerald-500/50 hover:bg-emerald-500/20"
+            >
+              <div className="flex h-8 w-8 items-center justify-center rounded-full border border-emerald-500/30 bg-emerald-500/20">
+                <Upload className="h-4 w-4 text-emerald-300" />
+              </div>
+              <span className="text-sm font-medium text-emerald-200">
+                {t("chats.importChatPackage")}
+              </span>
+            </button>
+
+            <button
+              onClick={handleHide}
+              disabled={hiding || !latestSessionByCharacter[selectedCharacter.id]}
+              className="flex w-full items-center gap-3 rounded-xl border border-amber-400/30 bg-amber-400/10 px-4 py-3 text-left transition hover:border-amber-400/50 hover:bg-amber-400/20 disabled:opacity-50"
+            >
+              <div className="flex h-8 w-8 items-center justify-center rounded-full border border-amber-400/30 bg-amber-400/20">
+                <EyeOff className="h-4 w-4 text-amber-400" />
+              </div>
+              <span className="text-sm font-medium text-amber-200">
+                {hiding ? "Hiding..." : t("chats.hideThisCharacter")}
+              </span>
+            </button>
+
+            <button
+              onClick={() => {
+                setShowDeleteConfirm(true);
+              }}
+              className="flex w-full items-center gap-3 rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-left transition hover:border-red-500/50 hover:bg-red-500/20"
+            >
+              <div className="flex h-8 w-8 items-center justify-center rounded-full border border-red-500/30 bg-red-500/20">
+                <Trash2 className="h-4 w-4 text-red-400" />
+              </div>
+              <span className="text-sm font-medium text-red-300">{t("chats.deleteCharacter")}</span>
+            </button>
+          </div>
+        )}
+      </BottomMenu>
+
+      <CharacterExportMenu
+        isOpen={exportMenuOpen}
+        onClose={() => {
+          setExportMenuOpen(false);
+          setExportTarget(null);
+        }}
+        onSelect={handleExportFormat}
+        exporting={exporting}
+      />
+
+{/* Delete Confirmation */}
+      <BottomMenu
+        isOpen={showDeleteConfirm}
+        onClose={() => setShowDeleteConfirm(false)}
+        title={t("chats.deleteCharacterTitle")}
+      >
+        <div className="space-y-4">
+          <p className="text-sm text-white/70">
+            {t("chats.deleteCharacterConfirmation", { name: selectedCharacter?.name ?? "" })}
+          </p>
+          <div className="flex gap-3">
+            <button
+              onClick={() => setShowDeleteConfirm(false)}
+              disabled={deleting}
+              className="flex-1 rounded-xl border border-white/10 bg-white/5 py-3 text-sm font-medium text-white transition hover:border-white/20 hover:bg-white/10 disabled:opacity-50"
+            >
+              {t("common.buttons.cancel")}
+            </button>
+            <button
+              onClick={handleDelete}
+              disabled={deleting}
+              className="flex-1 rounded-xl border border-red-500/30 bg-red-500/20 py-3 text-sm font-medium text-red-300 transition hover:bg-red-500/30 disabled:opacity-50"
+            >
+              {deleting ? t("common.buttons.deleting") : t("common.buttons.delete")}
+            </button>
+          </div>
+        </div>
+      </BottomMenu>
+
+      {/* Template selector */}
+      <ChatTemplateSelector
+        isOpen={!!templateSelectorCharacter}
+        onClose={() => setTemplateSelectorCharacter(null)}
+        templates={templateSelectorCharacter?.chatTemplates ?? []}
+        defaultTemplateId={templateSelectorCharacter?.defaultChatTemplateId}
+        onSelect={(templateId) => {
+          if (templateSelectorCharacter) {
+            createNewChat(templateSelectorCharacter, templateId);
+          }
+          setTemplateSelectorCharacter(null);
+        }}
+      />
+    </div>
+  );
+}
+
+const viewModeTransition = {
+  initial: { opacity: 0 },
+  animate: { opacity: 1 },
+  exit: { opacity: 0 },
+  transition: { duration: 0.2, ease: "easeInOut" as const },
+};
+
+function CharacterList({
+  characters,
+  viewMode,
+  onSelect,
+  onLongPress,
+}: {
+  characters: Character[];
+  viewMode: ChatsViewMode;
+  onSelect: (character: Character) => void | Promise<void>;
+  onLongPress: (character: Character) => void;
+}) {
+  const [visibleCount, setVisibleCount] = useState(10);
+
+  useEffect(() => {
+    if (visibleCount < characters.length) {
+      const timer = setTimeout(() => {
+        setVisibleCount((prev) => Math.min(prev + 10, characters.length));
+      }, 50);
+      return () => clearTimeout(timer);
+    }
+  }, [visibleCount, characters.length]);
+
+  useEffect(() => {
+    setVisibleCount(10);
+  }, [characters]);
+
+  const visible = characters.slice(0, visibleCount);
+  const renderListCard = (character: Character) =>
+    character.cardType === "banner" ? (
+      <BannerCharacterCard
+        key={character.id}
+        character={character}
+        onSelect={onSelect}
+        onLongPress={onLongPress}
+      />
+    ) : (
+      <CircleCharacterCard
+        key={character.id}
+        character={character}
+        onSelect={onSelect}
+        onLongPress={onLongPress}
+      />
+    );
+
+  return (
+    <AnimatePresence mode="wait" initial={false}>
+      {viewMode === "list" && (
+        <motion.div key="list" {...viewModeTransition} className="space-y-2 pb-24">
+          {visible.map((character) => renderListCard(character))}
+        </motion.div>
+      )}
+
+      {viewMode === "gallery" && (
+        <motion.div
+          key="gallery"
+          {...viewModeTransition}
+          className="space-y-2 lg:space-y-0 lg:grid lg:grid-cols-3 lg:gap-3 pb-24"
+        >
+          {visible.map((character) => (
+            <div key={character.id}>
+              <div className="lg:hidden">
+                {renderListCard(character)}
+              </div>
+              <div className="hidden lg:block">
+                <GalleryCard character={character} onSelect={onSelect} onLongPress={onLongPress} />
+              </div>
+            </div>
+          ))}
+        </motion.div>
+      )}
+
+      {viewMode === "hero" && (
+        <motion.div key="hero" {...viewModeTransition} className="space-y-2 lg:space-y-3 pb-24">
+          {visible[0] && (
+            <>
+              <div className="lg:hidden">
+                {renderListCard(visible[0])}
+              </div>
+              <div className="hidden lg:block">
+                <HeroCard character={visible[0]} onSelect={onSelect} onLongPress={onLongPress} />
+              </div>
+            </>
+          )}
+          {visible.length > 1 && (
+            <div className="space-y-2 lg:space-y-0 lg:grid lg:grid-cols-2 lg:gap-3">
+              {visible.slice(1).map((character) => renderListCard(character))}
+            </div>
+          )}
+        </motion.div>
+      )}
+    </AnimatePresence>
+  );
+}
+
+function CharacterSkeleton() {
+  return (
+    <div className={spacing.item}>
+      {[0, 1, 2].map((index) => (
+        <div
+          key={index}
+          className={cn(
+            "h-16 animate-pulse p-2 pr-4",
+            "rounded-full",
+            "border border-white/5 bg-white/5",
+          )}
+        >
+          <div className="flex items-center gap-3">
+            <div className="h-12 w-12 rounded-full bg-white/10" />
+            <div className="flex-1 space-y-2">
+              <div className="h-3.5 w-1/3 rounded-full bg-white/10" />
+              <div className="h-3 w-2/3 rounded-full bg-white/5" />
+            </div>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+type ChatsPageCache = {
+  characters: Character[];
+  latestSessionByCharacter: Record<string, { id: string; updatedAt: number; archived: boolean }>;
+};
+
+let chatsPageCache: ChatsPageCache | null = null;
+
+function EmptyState() {
+  const { t } = useI18n();
+  return (
+    <div
+      className={cn(
+        "p-8 text-center",
+        radius.lg,
+        "border border-dashed border-white/10 bg-white/2",
+      )}
+    >
+      <div className={spacing.field}>
+        <h3 className={cn(typography.h3.size, typography.h3.weight, "text-white")}>
+          {t("chats.noCharactersYet")}
+        </h3>
+        <p className={cn(typography.body.size, typography.body.lineHeight, "text-white/50")}>
+          {t("chats.createFirstCharacter")}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function NoResultsState({ query }: { query: string }) {
+  const { t } = useI18n();
+  return (
+    <div
+      className={cn(
+        "p-8 text-center",
+        radius.lg,
+        "border border-dashed border-white/10 bg-white/2",
+      )}
+    >
+      <div className={spacing.field}>
+        <SearchX className="mx-auto h-6 w-6 text-white/30" />
+        <h3 className={cn(typography.h3.size, typography.h3.weight, "text-white")}>
+          {t("pageHeader.noResultsTitle")}
+        </h3>
+        <p className={cn(typography.body.size, typography.body.lineHeight, "text-white/50")}>
+          {t("pageHeader.noResultsBody", { query })}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function isImageLike(s?: string) {
+  return isRenderableImageUrl(s);
+}
+
+const CharacterAvatar = memo(
+  ({
+    character,
+    className,
+    variant = "round",
+  }: {
+    character: Character;
+    className?: string;
+    variant?: "round" | "banner";
+  }) => {
+    const avatarUrl = useAvatar("character", character.id, character.avatarPath, variant);
+
+    if (avatarUrl && isImageLike(avatarUrl)) {
+      return (
+        <AvatarImage
+          src={avatarUrl}
+          alt={`${character.name} avatar`}
+          crop={variant === "banner" ? character.bannerCrop : character.avatarCrop}
+          applyCrop={variant !== "banner"}
+          className={className}
+        />
+      );
+    }
+
+    // Fallback: initials with a subtle gradient
+    const initials = character.name.slice(0, 2).toUpperCase();
+    return (
+      <div
+        className={cn(
+          "flex h-full w-full items-center justify-center",
+          "bg-linear-to-br from-white/20 to-white/5",
+          className,
+        )}
+      >
+        <span className="text-lg font-bold text-white/80">{initials}</span>
+      </div>
+    );
+  },
+);
+
+CharacterAvatar.displayName = "CharacterAvatar";
+
+const CharacterCard = memo(
+  ({
+    character,
+    onSelect,
+    onLongPress,
+  }: {
+    character: Character;
+    onSelect: (character: Character) => void;
+    onLongPress: (character: Character) => void;
+  }) => {
+    const { t } = useI18n();
+    const descriptionPreview =
+      (character.description || character.definition || "").trim() ||
+      t("common.labels.noDescriptionYet");
+    const { gradientCss, hasGradient, textColor, textSecondary } = useAvatarGradient(
+      "character",
+      character.id,
+      character.avatarPath,
+      character.disableAvatarGradient,
+      // Pass custom colors if enabled
+      character.customGradientEnabled && character.customGradientColors?.length
+        ? {
+            colors: character.customGradientColors,
+            textColor: character.customTextColor,
+            textSecondary: character.customTextSecondary,
+          }
+        : undefined,
+      character.avatarGradientSource ?? "base",
+    );
+    // Long-press support for desktop
+    const longPressTimer = useRef<number | null>(null);
+    const isLongPress = useRef(false);
+
+    const handlePointerDown = () => {
+      isLongPress.current = false;
+      longPressTimer.current = window.setTimeout(() => {
+        isLongPress.current = true;
+        onLongPress(character);
+      }, 500);
+    };
+
+    const handlePointerUp = () => {
+      if (longPressTimer.current) {
+        clearTimeout(longPressTimer.current);
+        longPressTimer.current = null;
+      }
+    };
+
+    const handlePointerLeave = () => {
+      if (longPressTimer.current) {
+        clearTimeout(longPressTimer.current);
+        longPressTimer.current = null;
+      }
+    };
+
+    const handleClick = () => {
+      // Don't trigger click if it was a long press
+      if (isLongPress.current) {
+        isLongPress.current = false;
+        return;
+      }
+      onSelect(character);
+    };
+
+    const handleContextMenu = (e: React.MouseEvent) => {
+      e.preventDefault();
+      onLongPress(character);
+    };
+
+    return (
+      <button
+        onClick={handleClick}
+        onContextMenu={handleContextMenu}
+        onPointerDown={handlePointerDown}
+        onPointerUp={handlePointerUp}
+        onPointerLeave={handlePointerLeave}
+        className={cn(
+          "group relative flex w-full items-center gap-3.5 lg:gap-6 p-3.5 lg:p-6 text-left overflow-hidden",
+          "rounded-2xl lg:rounded-3xl",
+          interactive.transition.default,
+          interactive.active.scale,
+          hasGradient ? "" : "border border-white/10 bg-[#1a1b23] hover:bg-[#22232d]",
+        )}
+        style={
+          hasGradient
+            ? {
+                background: gradientCss,
+                boxShadow: "inset 0 0 0 1px rgba(255, 255, 255, 0.12)",
+              }
+            : {}
+        }
+      >
+        {/* Circular Avatar */}
+        <div
+          className={cn(
+            "relative h-14 w-14 lg:h-24 lg:w-24 shrink-0 overflow-hidden rounded-full",
+            hasGradient ? "ring-2 ring-white/25" : "ring-1 ring-white/15",
+            "shadow-lg",
+          )}
+        >
+          <CharacterAvatar character={character} />
+        </div>
+
+        {/* Content */}
+        <div className="flex  min-w-0 flex-1 flex-col gap-0.5 lg:gap-1.5 py-1">
+          <h3
+            className={cn(
+              "truncate font-semibold text-[15px] lg:text-xl leading-tight",
+              hasGradient ? "" : "text-white",
+            )}
+            style={hasGradient ? { color: textColor } : {}}
+          >
+            {character.name}
+          </h3>
+          <p
+            className={cn(
+              "line-clamp-1 lg:line-clamp-2 text-[13px] lg:text-base leading-tight lg:leading-relaxed",
+              hasGradient ? "" : "text-white/50",
+            )}
+            style={hasGradient ? { color: textSecondary } : {}}
+          >
+            {descriptionPreview}
+          </p>
+        </div>
+
+        {/* chevron */}
+        <svg
+          width="20"
+          height="20"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          className={cn(
+            "shrink-0 transition-all",
+            hasGradient ? "" : "text-white/30 group-hover:text-white/60",
+          )}
+          style={hasGradient ? { color: textSecondary } : {}}
+        >
+          <path d="m9 18 6-6-6-6" />
+        </svg>
+      </button>
+    );
+  },
+);
+
+CharacterCard.displayName = "CharacterCard";
+
+function useLongPress(
+  character: Character,
+  onSelect: (c: Character) => void,
+  onLongPress: (c: Character) => void,
+) {
+  const longPressTimer = useRef<number | null>(null);
+  const isLong = useRef(false);
+
+  const handlePointerDown = () => {
+    isLong.current = false;
+    longPressTimer.current = window.setTimeout(() => {
+      isLong.current = true;
+      onLongPress(character);
+    }, 500);
+  };
+
+  const handlePointerUp = () => {
+    if (longPressTimer.current) {
+      clearTimeout(longPressTimer.current);
+      longPressTimer.current = null;
+    }
+  };
+
+  const handlePointerLeave = () => {
+    if (longPressTimer.current) {
+      clearTimeout(longPressTimer.current);
+      longPressTimer.current = null;
+    }
+  };
+
+  const handleClick = () => {
+    if (isLong.current) {
+      isLong.current = false;
+      return;
+    }
+    onSelect(character);
+  };
+
+  const handleContextMenu = (e: React.MouseEvent) => {
+    e.preventDefault();
+    onLongPress(character);
+  };
+
+  return { handlePointerDown, handlePointerUp, handlePointerLeave, handleClick, handleContextMenu };
+}
+
+const HeroCard = memo(
+  ({
+    character,
+    onSelect,
+    onLongPress,
+  }: {
+    character: Character;
+    onSelect: (character: Character) => void;
+    onLongPress: (character: Character) => void;
+  }) => {
+    const { t } = useI18n();
+    const descriptionPreview =
+      (character.description || character.definition || "").trim() ||
+      t("common.labels.noDescriptionYet");
+    const { gradientCss, hasGradient, textColor, textSecondary } = useAvatarGradient(
+      "character",
+      character.id,
+      character.avatarPath,
+      character.disableAvatarGradient,
+      character.customGradientEnabled && character.customGradientColors?.length
+        ? {
+            colors: character.customGradientColors,
+            textColor: character.customTextColor,
+            textSecondary: character.customTextSecondary,
+          }
+        : undefined,
+      character.avatarGradientSource ?? "base",
+    );
+    const {
+      handlePointerDown,
+      handlePointerUp,
+      handlePointerLeave,
+      handleClick,
+      handleContextMenu,
+    } = useLongPress(character, onSelect, onLongPress);
+
+    const isBannerStyle = (character.cardType ?? "circle") === "banner";
+
+    if (isBannerStyle) {
+      return (
+        <button
+          onClick={handleClick}
+          onContextMenu={handleContextMenu}
+          onPointerDown={handlePointerDown}
+          onPointerUp={handlePointerUp}
+          onPointerLeave={handlePointerLeave}
+          className={cn(
+            "group relative flex w-full text-left overflow-hidden",
+            "h-44 lg:h-52",
+            "rounded-3xl",
+            interactive.transition.default,
+            interactive.active.scale,
+            hasGradient ? "" : "border border-white/10 bg-[#1a1b23] hover:bg-[#22232d]",
+          )}
+          style={
+            hasGradient
+              ? {
+                  background: gradientCss,
+                  boxShadow: "inset 0 0 0 1px rgba(255, 255, 255, 0.12)",
+                }
+              : {}
+          }
+        >
+          {/* Cover Avatar — fills left, fades on right.
+              max-w prevents the slot from getting too wide on large viewports. */}
+          <div
+            aria-hidden
+            className="absolute inset-y-0 left-0 w-3/5 lg:w-1/2 max-w-[560px] overflow-hidden"
+            style={{
+              WebkitMaskImage:
+                "linear-gradient(to right, black 0%, black 55%, transparent 100%)",
+              maskImage:
+                "linear-gradient(to right, black 0%, black 55%, transparent 100%)",
+            }}
+          >
+            <div className="h-full w-full origin-center scale-[1.14] transition-transform duration-500 ease-out group-hover:-translate-x-3 group-hover:scale-[1.14]">
+              <CharacterAvatar character={character} variant="banner" />
+            </div>
+          </div>
+
+          {/* Darkening scrim */}
+          <div
+            aria-hidden
+            className="pointer-events-none absolute inset-0 transition-opacity duration-300 group-hover:opacity-90"
+            style={{
+              background:
+                "linear-gradient(to right, rgba(0,0,0,0) 28%, rgba(0,0,0,0.45) 60%, rgba(0,0,0,0.55) 100%)",
+            }}
+          />
+
+          {/* Hover highlight */}
+          <div
+            aria-hidden
+            className="pointer-events-none absolute inset-0 opacity-0 transition-opacity duration-300 group-hover:opacity-100"
+            style={{
+              background:
+                "radial-gradient(120% 80% at 30% 50%, rgba(255,255,255,0.06) 0%, transparent 60%)",
+            }}
+          />
+
+          {/* Content */}
+          <div className="relative z-10 flex w-full items-center gap-4 pl-[42%] lg:pl-[36%] pr-6 lg:pr-8 py-6 lg:py-8">
+            <div className="flex min-w-0 flex-1 flex-col gap-2">
+              <h3
+                className={cn(
+                  "truncate font-bold text-2xl leading-tight drop-shadow-sm",
+                  hasGradient ? "" : "text-white",
+                )}
+                style={hasGradient ? { color: textColor } : {}}
+              >
+                {character.name}
+              </h3>
+              <p
+                className={cn(
+                  "line-clamp-3 text-base leading-relaxed",
+                  hasGradient ? "" : "text-white/50",
+                )}
+                style={hasGradient ? { color: textSecondary } : {}}
+              >
+                {descriptionPreview}
+              </p>
+            </div>
+            <svg
+              width="24"
+              height="24"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              className={cn(
+                "shrink-0 transition-all duration-300 group-hover:translate-x-1",
+                hasGradient ? "" : "text-white/30 group-hover:text-white/60",
+              )}
+              style={hasGradient ? { color: textSecondary } : {}}
+            >
+              <path d="m9 18 6-6-6-6" />
+            </svg>
+          </div>
+        </button>
+      );
+    }
+
+    return (
+      <button
+        onClick={handleClick}
+        onContextMenu={handleContextMenu}
+        onPointerDown={handlePointerDown}
+        onPointerUp={handlePointerUp}
+        onPointerLeave={handlePointerLeave}
+        className={cn(
+          "group relative flex w-full items-center gap-8 p-8 text-left overflow-hidden",
+          "rounded-3xl",
+          interactive.transition.default,
+          interactive.active.scale,
+          hasGradient ? "" : "border border-white/10 bg-[#1a1b23] hover:bg-[#22232d]",
+        )}
+        style={
+          hasGradient
+            ? {
+                background: gradientCss,
+                boxShadow: "inset 0 0 0 1px rgba(255, 255, 255, 0.12)",
+              }
+            : {}
+        }
+      >
+        {/* Large Avatar */}
+        <div
+          className={cn(
+            "relative h-32 w-32 shrink-0 overflow-hidden rounded-full",
+            hasGradient ? "ring-2 ring-white/25" : "ring-2 ring-white/15",
+            "shadow-xl",
+          )}
+        >
+          <CharacterAvatar character={character} />
+        </div>
+
+        {/* Content */}
+        <div className="flex min-w-0 flex-1 flex-col gap-2 py-1">
+          <h3
+            className={cn(
+              "truncate font-bold text-2xl leading-tight",
+              hasGradient ? "" : "text-white",
+            )}
+            style={hasGradient ? { color: textColor } : {}}
+          >
+            {character.name}
+          </h3>
+          <p
+            className={cn(
+              "line-clamp-3 text-base leading-relaxed",
+              hasGradient ? "" : "text-white/50",
+            )}
+            style={hasGradient ? { color: textSecondary } : {}}
+          >
+            {descriptionPreview}
+          </p>
+        </div>
+
+        {/* Chevron */}
+        <svg
+          width="24"
+          height="24"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          className={cn(
+            "shrink-0 transition-all",
+            hasGradient ? "" : "text-white/30 group-hover:text-white/60",
+          )}
+          style={hasGradient ? { color: textSecondary } : {}}
+        >
+          <path d="m9 18 6-6-6-6" />
+        </svg>
+      </button>
+    );
+  },
+);
+
+HeroCard.displayName = "HeroCard";
+
+const GalleryCard = memo(
+  ({
+    character,
+    onSelect,
+    onLongPress,
+  }: {
+    character: Character;
+    onSelect: (character: Character) => void;
+    onLongPress: (character: Character) => void;
+  }) => {
+    const { t } = useI18n();
+    const descriptionPreview =
+      (character.description || character.definition || "").trim() ||
+      t("common.labels.noDescriptionYet");
+    const avatarUrl = useAvatar("character", character.id, character.avatarPath, "base");
+    const hasAvatar = avatarUrl && isImageLike(avatarUrl);
+    const { gradientCss, hasGradient } = useAvatarGradient(
+      "character",
+      character.id,
+      character.avatarPath,
+      character.disableAvatarGradient,
+      character.customGradientEnabled && character.customGradientColors?.length
+        ? {
+            colors: character.customGradientColors,
+            textColor: character.customTextColor,
+            textSecondary: character.customTextSecondary,
+          }
+        : undefined,
+      character.avatarGradientSource ?? "base",
+    );
+    const {
+      handlePointerDown,
+      handlePointerUp,
+      handlePointerLeave,
+      handleClick,
+      handleContextMenu,
+    } = useLongPress(character, onSelect, onLongPress);
+
+    return (
+      <button
+        onClick={handleClick}
+        onContextMenu={handleContextMenu}
+        onPointerDown={handlePointerDown}
+        onPointerUp={handlePointerUp}
+        onPointerLeave={handlePointerLeave}
+        className={cn(
+          "group relative flex w-full flex-col overflow-hidden text-left",
+          "aspect-3/4 rounded-2xl border border-white/12",
+          interactive.transition.default,
+          interactive.active.scale,
+          !hasAvatar && !hasGradient ? "bg-[#1a1b23]" : "",
+        )}
+        style={
+          hasAvatar
+            ? {
+                backgroundImage: `url(${avatarUrl})`,
+                backgroundSize: "cover",
+                backgroundPosition: "center",
+              }
+            : hasGradient
+              ? { background: gradientCss }
+              : {}
+        }
+      >
+        {/* Dark scrim at bottom */}
+        <div className="mt-auto relative z-10">
+          <div className="absolute inset-0 -top-16 bg-linear-to-t from-black/80 via-black/40 to-transparent" />
+          <div className="relative p-4 pt-6">
+            <h3 className="truncate font-semibold text-lg leading-tight text-white drop-shadow-md">
+              {character.name}
+            </h3>
+            <p className="line-clamp-1 text-sm leading-snug text-white/70 mt-0.5 drop-shadow-md">
+              {descriptionPreview}
+            </p>
+          </div>
+        </div>
+
+        {/* Fallback initials when no avatar and no gradient */}
+        {!hasAvatar && !hasGradient && (
+          <div className="absolute inset-0 flex items-center justify-center">
+            <span className="text-4xl font-bold text-white/15">
+              {character.name.slice(0, 2).toUpperCase()}
+            </span>
+          </div>
+        )}
+      </button>
+    );
+  },
+);
+
+GalleryCard.displayName = "GalleryCard";

@@ -1,0 +1,434 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use tauri::Manager;
+
+use crate::{
+    abort_manager, chat_manager, content_filter, dynamic_memory_approval,
+    dynamic_memory_run_manager, host_api, logger, migrations, post_turn_memory_scheduler,
+    storage_manager, sync, usage, utils,
+};
+
+use super::runtime::configure_onnxruntime_dylib;
+
+#[derive(Clone)]
+pub(crate) struct AnalyticsState {
+    pub(crate) enabled: bool,
+}
+
+fn read_analytics_enabled(app: &tauri::AppHandle) -> bool {
+    match crate::storage_manager::settings::internal_read_settings(app) {
+        Ok(Some(settings_json)) => {
+            let parsed: serde_json::Value = match serde_json::from_str(&settings_json) {
+                Ok(value) => value,
+                Err(err) => {
+                    utils::log_error(
+                        app,
+                        "settings",
+                        format!("Failed to parse settings JSON: {}", err),
+                    );
+                    return true;
+                }
+            };
+            parsed
+                .get("appState")
+                .and_then(|v| v.get("analyticsEnabled"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true)
+        }
+        Ok(None) => true,
+        Err(err) => {
+            utils::log_error(app, "settings", format!("Failed to read settings: {}", err));
+            true
+        }
+    }
+}
+
+fn read_pure_mode_level(app: &tauri::AppHandle) -> content_filter::PureModeLevel {
+    match crate::storage_manager::settings::internal_read_settings(app) {
+        Ok(Some(settings_json)) => {
+            let parsed: serde_json::Value = match serde_json::from_str(&settings_json) {
+                Ok(value) => value,
+                Err(_) => return content_filter::PureModeLevel::Standard,
+            };
+            content_filter::level_from_app_state(parsed.get("appState"))
+        }
+        Ok(None) => content_filter::PureModeLevel::Standard,
+        Err(_) => content_filter::PureModeLevel::Standard,
+    }
+}
+
+fn manage_core_state(app: &mut tauri::App) -> Arc<usage::app_activity::AppActiveUsageService> {
+    let abort_registry = abort_manager::AbortRegistry::new();
+    app.manage(abort_registry);
+
+    let dynamic_memory_run_manager = dynamic_memory_run_manager::DynamicMemoryRunManager::new();
+    app.manage(dynamic_memory_run_manager);
+
+    let post_turn_memory_scheduler = post_turn_memory_scheduler::PostTurnMemoryScheduler::new();
+    app.manage(post_turn_memory_scheduler);
+
+    let dynamic_memory_approval = dynamic_memory_approval::DynamicMemoryApprovalManager::new();
+    app.manage(dynamic_memory_approval);
+
+    let app_usage_service = Arc::new(usage::app_activity::AppActiveUsageService::new());
+    app.manage(app_usage_service.clone());
+
+    app.manage(crate::chat_manager::lorebook_generator::JobRegistry::new());
+
+    app.manage(sync::manager::SyncManagerState::new());
+    app.manage(host_api::HostApiManager::default());
+    // app.manage(crate::asr_manager::WhisperRuntimeState::default()); // disabled: asr_manager module commented out
+
+    app_usage_service
+}
+
+#[cfg(target_os = "android")]
+fn initialize_android_state(app: &mut tauri::App) {
+    use crate::android_monitor;
+
+    let monitor_state = android_monitor::initialize(app.handle())
+        .expect("Failed to initialize Android crash monitor state");
+    app.manage(monitor_state);
+    android_monitor::start_heartbeat_loop(app.handle().clone());
+}
+
+#[cfg(not(target_os = "android"))]
+fn initialize_android_state(_app: &mut tauri::App) {}
+
+fn initialize_logging(app: &mut tauri::App) {
+    let log_manager =
+        logger::LogManager::new(app.handle()).expect("Failed to initialize log manager");
+    app.manage(log_manager);
+    logger::set_global_app_handle(app.handle().clone());
+    if let Err(err) = utils::init_tracing(app.handle().clone()) {
+        eprintln!("Failed to initialize tracing: {}", err);
+    }
+    // crate::asr_manager::initialize_whisper_logging(); // disabled: asr_manager module commented out
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = if let Some(message) = info.payload().downcast_ref::<&str>() {
+            (*message).to_string()
+        } else if let Some(message) = info.payload().downcast_ref::<String>() {
+            message.clone()
+        } else {
+            "unknown panic payload".to_string()
+        };
+        let location = info
+            .location()
+            .map(|location| format!("{}:{}", location.file(), location.line()))
+            .unwrap_or_else(|| "unknown".to_string());
+        let current_thread = std::thread::current();
+        let thread_name = current_thread.name().unwrap_or("unnamed").to_string();
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let timestamp = chrono::Local::now().to_rfc3339();
+        let report = format!(
+            "timestamp: {timestamp}\nthread: {thread_name}\nlocation: {location}\npayload: {payload}\n\npanic_info: {info}\n\nbacktrace:\n{backtrace}\n"
+        );
+
+        eprintln!("panic report:\n{}", report);
+
+        if let Some(app_handle) = logger::get_global_app_handle() {
+            match logger::write_panic_report(&app_handle, &report) {
+                Ok(path) => {
+                    utils::log_error_global(
+                        "panic",
+                        format!(
+                            "Rust panic captured at {} on thread {}. Report: {}. Payload: {}",
+                            location,
+                            thread_name,
+                            path.display(),
+                            payload
+                        ),
+                    );
+                }
+                Err(err) => {
+                    utils::log_error_global(
+                        "panic",
+                        format!(
+                            "Rust panic captured at {} on thread {}. Failed to write report: {}. Payload: {}",
+                            location, thread_name, err, payload
+                        ),
+                    );
+                }
+            }
+        } else {
+            eprintln!("panic report file skipped: global app handle unavailable");
+        }
+
+        previous_hook(info);
+    }));
+}
+
+fn initialize_database(app: &mut tauri::App) {
+    configure_onnxruntime_dylib(app.handle());
+
+    match storage_manager::db::init_pool(app.handle()) {
+        Ok(pool) => {
+            let swappable = storage_manager::db::SwappablePool::new(pool);
+            app.manage(swappable);
+        }
+        Err(err) => panic!("Failed to initialize database pool: {}", err),
+    }
+
+    // Clear stale smart-offload layer caches on every startup. The cached
+    // layer counts are VRAM-availability snapshots from the previous session;
+    // available VRAM can differ significantly across restarts (GPU config
+    // changes, other apps, driver state). Only the cached layer count is
+    // removed — the rest of llamaLastRuntimeReport is user-facing diagnostics
+    // that persist across restarts.
+    match storage_manager::models::clear_all_llama_runtime_layer_caches(app.handle()) {
+        Ok(n) if n > 0 => {
+            eprintln!("[INFO] Cleared stale llama smart-offload layer cache for {n} model(s)");
+        }
+        Err(err) => {
+            eprintln!("[WARN] Failed to clear llama smart-offload layer cache on startup: {err}");
+        }
+        _ => {}
+    }
+}
+
+fn start_usage_flush_task(
+    app: &tauri::AppHandle,
+    usage_service: Arc<usage::app_activity::AppActiveUsageService>,
+) {
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            usage_service.flush(&app_handle);
+        }
+    });
+}
+
+fn configure_runtime_state(app: &mut tauri::App, aptabase_plugin_enabled: bool) {
+    let analytics_enabled = aptabase_plugin_enabled && read_analytics_enabled(app.handle());
+    app.manage(AnalyticsState {
+        enabled: analytics_enabled,
+    });
+    if analytics_enabled {
+        use tauri_plugin_aptabase::EventTracker;
+
+        if let Err(err) = app.track_event("app_started", None) {
+            utils::log_error(
+                app.handle(),
+                "aptabase",
+                format!("track_event(app_started) failed: {}", err),
+            );
+        }
+    }
+
+    let pure_mode_level = read_pure_mode_level(app.handle());
+    app.manage(content_filter::ContentFilter::new(pure_mode_level));
+}
+
+fn run_bootstrap_tasks(app: &tauri::AppHandle) {
+    if let Err(err) = storage_manager::importer::run_legacy_import(app) {
+        utils::log_error(app, "bootstrap", format!("Legacy import error: {}", err));
+    }
+
+    if let Err(err) = migrations::run_migrations(app) {
+        utils::log_error(app, "bootstrap", format!("Migration error: {}", err));
+    }
+
+    if let Err(err) = chat_manager::prompts::ensure_app_default_template(app) {
+        utils::log_error(
+            app,
+            "bootstrap",
+            format!("Failed to ensure app default template: {}", err),
+        );
+    }
+
+    if let Err(err) = chat_manager::prompts::ensure_local_roleplay_template(app) {
+        utils::log_error(
+            app,
+            "bootstrap",
+            format!("Failed to ensure local roleplay template: {}", err),
+        );
+    }
+
+    if let Err(err) = chat_manager::prompts::ensure_help_me_reply_template(app) {
+        utils::log_error(
+            app,
+            "bootstrap",
+            format!("Failed to ensure help me reply template: {}", err),
+        );
+    }
+
+    if let Err(err) = chat_manager::prompts::ensure_lorebook_entry_writer_template(app) {
+        utils::log_error(
+            app,
+            "bootstrap",
+            format!("Failed to ensure lorebook entry writer template: {}", err),
+        );
+    }
+
+    if let Err(err) = chat_manager::prompts::ensure_lorebook_keyword_generator_template(app) {
+        utils::log_error(
+            app,
+            "bootstrap",
+            format!(
+                "Failed to ensure lorebook keyword generator template: {}",
+                err
+            ),
+        );
+    }
+
+    if let Err(err) = chat_manager::prompts::ensure_dynamic_memory_templates(app) {
+        utils::log_error(
+            app,
+            "bootstrap",
+            format!("Failed to ensure dynamic memory templates: {}", err),
+        );
+    }
+
+    if let Err(err) = chat_manager::prompts::ensure_group_chat_templates(app) {
+        utils::log_error(
+            app,
+            "bootstrap",
+            format!("Failed to ensure group chat templates: {}", err),
+        );
+    }
+
+    if let Err(err) = chat_manager::prompts::ensure_avatar_image_templates(app) {
+        utils::log_error(
+            app,
+            "bootstrap",
+            format!("Failed to ensure avatar image templates: {}", err),
+        );
+    }
+
+    if let Err(err) = chat_manager::prompts::ensure_scene_generation_template(app) {
+        utils::log_error(
+            app,
+            "bootstrap",
+            format!("Failed to ensure scene generation template: {}", err),
+        );
+    }
+
+    if let Err(err) = chat_manager::prompts::ensure_scene_prompt_writer_template(app) {
+        utils::log_error(
+            app,
+            "bootstrap",
+            format!("Failed to ensure scene prompt writer template: {}", err),
+        );
+    }
+
+    if let Err(err) = chat_manager::prompts::ensure_design_reference_template(app) {
+        utils::log_error(
+            app,
+            "bootstrap",
+            format!("Failed to ensure design reference template: {}", err),
+        );
+    }
+
+    if let Err(err) = chat_manager::prompts::ensure_companion_soul_writer_template(app) {
+        utils::log_error(
+            app,
+            "bootstrap",
+            format!("Failed to ensure companion soul writer template: {}", err),
+        );
+    }
+}
+
+#[tauri::command]
+pub(crate) fn get_window_chrome_flags(app: tauri::AppHandle) -> Result<(bool, bool), String> {
+    let flags = app.state::<WindowChromeFlags>();
+    Ok((flags.os_decorations, flags.no_buttons))
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct WindowChromeFlags {
+    /// `--osdecorations`: re-enable the OS titlebar, ignore the in-app style.
+    pub os_decorations: bool,
+    /// `--nobuttons`: keep the frameless window but hide all custom chrome.
+    pub no_buttons: bool,
+}
+
+impl WindowChromeFlags {
+    pub fn from_env() -> Self {
+        let mut os_decorations = false;
+        let mut no_buttons = false;
+        for arg in std::env::args().skip(1) {
+            match arg.as_str() {
+                "--osdecorations" => os_decorations = true,
+                "--nobuttons" => no_buttons = true,
+                _ => {}
+            }
+        }
+        Self {
+            os_decorations,
+            no_buttons,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn configure_linux_webview_media(window: &tauri::WebviewWindow) {
+    let result = window.with_webview(|webview| {
+        use webkit2gtk::gio::prelude::Cast;
+        use webkit2gtk::{
+            PermissionRequestExt, SettingsExt, UserMediaPermissionRequest, WebViewExt,
+        };
+
+        let wv = webview.inner();
+        if let Some(settings) = WebViewExt::settings(&wv) {
+            settings.set_enable_media_stream(true);
+            settings.set_enable_mediasource(true);
+            settings.set_media_playback_requires_user_gesture(false);
+        }
+        wv.connect_permission_request(|_, request| {
+            if request
+                .downcast_ref::<UserMediaPermissionRequest>()
+                .is_some()
+            {
+                request.allow();
+                return true;
+            }
+            false
+        });
+    });
+
+    if let Err(err) = result {
+        utils::log_error(
+            window.app_handle(),
+            "webview",
+            format!(
+                "Failed to configure Linux webview media permissions: {}",
+                err
+            ),
+        );
+    }
+}
+
+pub(crate) fn setup_app(
+    app: &mut tauri::App,
+    aptabase_plugin_enabled: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let chrome_flags = WindowChromeFlags::from_env();
+    app.manage(chrome_flags);
+
+    #[cfg(not(mobile))]
+    if let Some(window) = app.get_webview_window("main") {
+        if chrome_flags.os_decorations {
+            let _ = window.set_decorations(true);
+        }
+        #[cfg(target_os = "linux")]
+        configure_linux_webview_media(&window);
+    }
+
+    let app_usage_service = manage_core_state(app);
+    initialize_android_state(app);
+    initialize_logging(app);
+    initialize_database(app);
+    start_usage_flush_task(app.handle(), app_usage_service);
+    configure_runtime_state(app, aptabase_plugin_enabled);
+    run_bootstrap_tasks(app.handle());
+    let app_handle = app.handle().clone();
+    tauri::async_runtime::spawn(async move {
+        host_api::maybe_start_from_settings(&app_handle).await;
+    });
+
+    Ok(())
+}

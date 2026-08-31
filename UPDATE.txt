@@ -1,0 +1,14 @@
+keytool -genkey -v -keystore havenapp-release.jks -keyalg RSA -keysize 2048 -validity 10000 -alias havenapp
+
+$env:JAVA_HOME="C:\Program Files\Eclipse Adoptium\jdk-17.0.17.10-hotspot"
+$env:PATH="$env:JAVA_HOME\bin;$env:PATH"
+cd .\src-tauri\gen\android
+.\gradlew.bat --stop
+.\gradlew.bat -version
+cd ..\..\..
+
+
+npx tauri android build --target aarch64 --debug
+
+
+adb install -r "D:\HavenApp\app-main\src-tauri\gen\android\app\build\outputs\apk\universal\debug\app-universal-debug.apk"

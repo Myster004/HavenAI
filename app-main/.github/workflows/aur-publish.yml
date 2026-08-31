@@ -1,0 +1,120 @@
+name: Prepare / Publish / AUR
+
+run-name: AUR package ${{ inputs.variant }} by @${{ github.actor }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      asset_url:
+        description: "Direct HTTPS URL to the Linux release tar.gz asset"
+        required: true
+        type: string
+      asset_sha256:
+        description: "Expected SHA256 of the Linux release tar.gz asset"
+        required: false
+        default: ""
+        type: string
+      variant:
+        description: "Linux desktop variant to package"
+        required: true
+        default: cpu
+        type: choice
+        options:
+          - cpu
+          - vulkan
+          - cuda
+      pkgrel:
+        description: "Arch pkgrel to write into PKGBUILD/.SRCINFO"
+        required: false
+        default: "1"
+        type: string
+      publish:
+        description: "Push generated files to the matching AUR repo"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  aur:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate AUR package files
+        run: |
+          bash scripts/prepare-aur-package.sh \
+            '${{ inputs.asset_url }}' \
+            '${{ inputs.variant }}' \
+            aur-out \
+            '${{ inputs.pkgrel }}' \
+            '${{ inputs.asset_sha256 }}'
+
+      - name: Load package metadata
+        run: cat aur-out/aur-package.env >> "$GITHUB_ENV"
+
+      - name: Upload generated AUR files
+        uses: actions/upload-artifact@v4
+        with:
+          name: aur-${{ inputs.variant }}
+          path: |
+            aur-out/PKGBUILD
+            aur-out/.SRCINFO
+            aur-out/aur-package.env
+          if-no-files-found: error
+
+      - name: Append workflow summary
+        run: |
+          {
+            echo "## AUR package"
+            echo "- pkgname: \`${PKGNAME}\`"
+            echo "- pkgver: \`${PKGVER}\`"
+            echo "- pkgrel: \`${PKGREL}\`"
+            echo "- variant: \`${VARIANT}\`"
+            echo "- asset: ${ASSET_URL}"
+            echo "- sha256: \`${ASSET_SHA256}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Start ssh-agent
+        if: ${{ inputs.publish == true }}
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+
+      - name: Trust AUR host key
+        if: ${{ inputs.publish == true }}
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
+
+      - name: Publish to AUR
+        if: ${{ inputs.publish == true }}
+        env:
+          AUR_PACKAGER_NAME: ${{ secrets.AUR_PACKAGER_NAME }}
+          AUR_PACKAGER_EMAIL: ${{ secrets.AUR_PACKAGER_EMAIL }}
+        run: |
+          if [[ -z "${AUR_PACKAGER_NAME}" || -z "${AUR_PACKAGER_EMAIL}" ]]; then
+            echo "AUR_PACKAGER_NAME and AUR_PACKAGER_EMAIL secrets are required when publish=true." >&2
+            exit 1
+          fi
+
+          repo_dir="${RUNNER_TEMP}/${PKGNAME}"
+          git clone "ssh://aur@aur.archlinux.org/${PKGNAME}.git" "${repo_dir}"
+          install -m 0644 aur-out/PKGBUILD "${repo_dir}/PKGBUILD"
+          install -m 0644 aur-out/.SRCINFO "${repo_dir}/.SRCINFO"
+
+          git -C "${repo_dir}" config user.name "${AUR_PACKAGER_NAME}"
+          git -C "${repo_dir}" config user.email "${AUR_PACKAGER_EMAIL}"
+
+          if git -C "${repo_dir}" diff --quiet -- PKGBUILD .SRCINFO; then
+            echo "No AUR changes to publish."
+            exit 0
+          fi
+
+          git -C "${repo_dir}" add PKGBUILD .SRCINFO
+          git -C "${repo_dir}" commit -m "Update ${PKGNAME} to ${PKGVER}-${PKGREL}"
+          git -C "${repo_dir}" push origin HEAD

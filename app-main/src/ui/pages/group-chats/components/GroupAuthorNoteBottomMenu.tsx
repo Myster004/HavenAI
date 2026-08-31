@@ -1,0 +1,144 @@
+import { useEffect, useMemo, useState } from "react";
+import type { GroupSession } from "../../../../core/storage/schemas";
+import { updateGroupSessionAuthorNote } from "../../../../core/storage/repo";
+import { BottomMenu } from "../../../components/BottomMenu";
+import { Switch } from "../../../components/Switch";
+import { cn, radius } from "../../../design-tokens";
+import { useI18n } from "../../../../core/i18n/context";
+import {
+  useAuthorNoteInlineEditor,
+  setAuthorNoteInlineEditor,
+} from "../../chats/components/useAuthorNoteInlineEditor";
+
+interface GroupAuthorNoteBottomMenuProps {
+  isOpen: boolean;
+  onClose: () => void;
+  session: GroupSession | null | undefined;
+  onSaved?: (session: GroupSession) => void;
+}
+
+export function GroupAuthorNoteBottomMenu({
+  isOpen,
+  onClose,
+  session,
+  onSaved,
+}: GroupAuthorNoteBottomMenuProps) {
+  const [draft, setDraft] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const inlineEditorEnabled = useAuthorNoteInlineEditor();
+  const { t } = useI18n();
+
+  useEffect(() => {
+    if (!isOpen) return;
+    setDraft(session?.authorNote ?? "");
+    setError(null);
+  }, [isOpen, session?.authorNote]);
+
+  const trimmedDraft = draft.trim();
+  const savedValue = session?.authorNote?.trim() ?? "";
+  const isDirty = trimmedDraft !== savedValue;
+
+  const footerText = useMemo(() => {
+    if (!trimmedDraft) {
+      return savedValue
+        ? t("chats.authorNote.willBeRemoved")
+        : t("chats.authorNote.noNoteSaved");
+    }
+    return t("chats.authorNote.charactersCount", { count: trimmedDraft.length });
+  }, [savedValue, trimmedDraft, t]);
+
+  const persist = async (value: string | null) => {
+    if (!session?.id || saving) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const updated = await updateGroupSessionAuthorNote(session.id, value);
+      onSaved?.(updated);
+      onClose();
+    } catch (err) {
+      console.error("Failed to save author note:", err);
+      setError(typeof err === "string" ? err : t("chats.authorNote.failedSave"));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <BottomMenu
+      isOpen={isOpen}
+      onClose={() => {
+        if (!saving) onClose();
+      }}
+      title={t("chats.authorNote.title")}
+    >
+      <div className="space-y-4">
+        <div
+          className={cn(
+            "flex items-center justify-between gap-3 px-3 py-2.5",
+            radius.md,
+            "border border-fg/10 bg-fg/[0.03]",
+          )}
+        >
+          <div className="min-w-0">
+            <p className="text-sm font-medium text-fg">{t("chats.authorNote.inlineEditor")}</p>
+            <p className="mt-0.5 text-xs text-fg/45">{t("chats.authorNote.inlineEditorDesc")}</p>
+          </div>
+          <Switch
+            checked={inlineEditorEnabled}
+            onChange={setAuthorNoteInlineEditor}
+            aria-label={t("chats.authorNote.toggleInlineEditor")}
+          />
+        </div>
+
+        <textarea
+          value={draft}
+          onChange={(event) => setDraft(event.target.value)}
+          disabled={!session?.id || saving}
+          placeholder={t("chats.authorNote.placeholder")}
+          rows={8}
+          className={cn(
+            "w-full resize-none border bg-fg/[0.04] px-3 py-3 text-sm leading-relaxed text-fg outline-none",
+            "placeholder:text-fg/35 focus:border-fg/25 focus:bg-fg/[0.06]",
+            "disabled:cursor-not-allowed disabled:opacity-60",
+            radius.md,
+          )}
+        />
+
+        <div className="flex items-center justify-between gap-3 text-xs text-fg/45">
+          <span>{footerText}</span>
+          {error ? <span className="text-red-300">{error}</span> : null}
+        </div>
+
+        <div className="grid grid-cols-2 gap-2">
+          <button
+            type="button"
+            onClick={() => void persist(null)}
+            disabled={!session?.id || saving || !savedValue}
+            className={cn(
+              "h-11 border px-3 text-sm font-semibold transition",
+              radius.md,
+              "border-fg/10 bg-fg/[0.04] text-fg/75 hover:border-fg/20 hover:bg-fg/[0.07]",
+              "disabled:cursor-not-allowed disabled:opacity-45",
+            )}
+          >
+            {t("chats.authorNote.clear")}
+          </button>
+          <button
+            type="button"
+            onClick={() => void persist(trimmedDraft || null)}
+            disabled={!session?.id || saving || !isDirty}
+            className={cn(
+              "h-11 border px-3 text-sm font-semibold transition",
+              radius.md,
+              "border-emerald-400/35 bg-emerald-500/20 text-emerald-100 hover:bg-emerald-500/30",
+              "disabled:cursor-not-allowed disabled:opacity-45",
+            )}
+          >
+            {saving ? t("chats.authorNote.saving") : t("chats.authorNote.save")}
+          </button>
+        </div>
+      </div>
+    </BottomMenu>
+  );
+}

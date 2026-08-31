@@ -1,0 +1,540 @@
+use std::sync::OnceLock;
+use tauri::AppHandle;
+
+use crate::storage_manager::{
+    characters::characters_list_typed,
+    memory_embeddings,
+    personas::personas_list_typed,
+    sessions::{
+        messages_list_internal, messages_list_pinned_internal, messages_upsert_batch_internal,
+        session_get_meta_internal, session_upsert_meta_internal,
+    },
+    settings::{read_settings_typed, write_settings_typed},
+};
+
+use crate::chat_manager::prompt_engine;
+use crate::chat_manager::types::{
+    AccessibilitySettings, AccessibilitySoundSettings, AdvancedModelSettings, AdvancedSettings,
+    Character, DynamicMemoryStructuredFallbackFormat, Model, Persona, ProviderCredential, Session,
+    Settings, StoredMessage, SystemPromptEntry,
+};
+
+#[derive(Debug, Clone, Copy)]
+pub enum PromptType {
+    SystemPrompt,
+    LocalRoleplayPrompt,
+    CompanionPrompt,
+    DynamicMemoryPrompt,
+    DynamicMemoryLocalPrompt,
+    DynamicSummaryPrompt,
+    HelpMeReplyPrompt,
+    HelpMeReplyConversationalPrompt,
+    LorebookEntryWriterPrompt,
+    LorebookKeywordGeneratorPrompt,
+    LorebookGeneratorPlannerPrompt,
+    LorebookGeneratorWriterPrompt,
+    LorebookGeneratorRefinePrompt,
+    LorebookGeneratorCoherencePrompt,
+    GroupChatPrompt,
+    GroupChatRoleplayPrompt,
+    AvatarGenerationPrompt,
+    AvatarEditPrompt,
+    SceneGenerationPrompt,
+    ScenePromptWriterPrompt,
+    DesignReferencePrompt,
+    CompanionSoulWriterPrompt,
+    CompanionGrowthcyclePrompt,
+    CompanionConsolidationPrompt,
+}
+
+pub fn get_base_prompt(prompt_type: PromptType) -> String {
+    match prompt_type {
+        PromptType::SystemPrompt => prompt_engine::default_system_prompt_template(),
+        PromptType::LocalRoleplayPrompt => prompt_engine::default_local_roleplay_prompt(),
+        PromptType::CompanionPrompt => prompt_engine::default_companion_prompt(),
+        PromptType::DynamicMemoryPrompt => prompt_engine::default_dynamic_memory_prompt(),
+        PromptType::DynamicMemoryLocalPrompt => {
+            prompt_engine::default_dynamic_memory_local_prompt()
+        }
+        PromptType::DynamicSummaryPrompt => prompt_engine::default_dynamic_summary_prompt(),
+        PromptType::HelpMeReplyPrompt => prompt_engine::default_help_me_reply_prompt(),
+        PromptType::HelpMeReplyConversationalPrompt => {
+            prompt_engine::default_help_me_reply_conversational_prompt()
+        }
+        PromptType::LorebookEntryWriterPrompt => {
+            prompt_engine::default_lorebook_entry_writer_prompt()
+        }
+        PromptType::LorebookKeywordGeneratorPrompt => {
+            prompt_engine::default_lorebook_keyword_generator_prompt()
+        }
+        PromptType::LorebookGeneratorPlannerPrompt => {
+            prompt_engine::default_lorebook_generator_planner_prompt()
+        }
+        PromptType::LorebookGeneratorWriterPrompt => {
+            prompt_engine::default_lorebook_generator_writer_prompt()
+        }
+        PromptType::LorebookGeneratorRefinePrompt => {
+            prompt_engine::default_lorebook_generator_refine_prompt()
+        }
+        PromptType::LorebookGeneratorCoherencePrompt => {
+            prompt_engine::default_lorebook_generator_coherence_prompt()
+        }
+        PromptType::GroupChatPrompt => prompt_engine::default_group_chat_system_prompt_template(),
+        PromptType::GroupChatRoleplayPrompt => {
+            prompt_engine::default_group_chat_roleplay_prompt_template()
+        }
+        PromptType::AvatarGenerationPrompt => prompt_engine::default_avatar_generation_prompt(),
+        PromptType::AvatarEditPrompt => prompt_engine::default_avatar_edit_prompt(),
+        PromptType::SceneGenerationPrompt => prompt_engine::default_scene_generation_prompt(),
+        PromptType::ScenePromptWriterPrompt => prompt_engine::default_scene_prompt_writer_prompt(),
+        PromptType::DesignReferencePrompt => prompt_engine::default_design_reference_prompt(),
+        PromptType::CompanionSoulWriterPrompt => {
+            prompt_engine::default_companion_soul_writer_prompt()
+        }
+        PromptType::CompanionGrowthcyclePrompt => {
+            prompt_engine::default_companion_growthcycle_prompt()
+        }
+        PromptType::CompanionConsolidationPrompt => {
+            prompt_engine::default_companion_consolidation_prompt()
+        }
+    }
+}
+
+pub fn get_base_prompt_entries(prompt_type: PromptType) -> Vec<SystemPromptEntry> {
+    match prompt_type {
+        PromptType::SystemPrompt => prompt_engine::default_modular_prompt_entries(),
+        PromptType::LocalRoleplayPrompt => prompt_engine::default_local_roleplay_entries(),
+        PromptType::CompanionPrompt => prompt_engine::default_companion_entries(),
+        PromptType::DynamicMemoryPrompt => prompt_engine::default_dynamic_memory_entries(),
+        PromptType::DynamicMemoryLocalPrompt => {
+            prompt_engine::default_dynamic_memory_local_entries()
+        }
+        PromptType::DynamicSummaryPrompt => prompt_engine::default_dynamic_summary_entries(),
+        PromptType::HelpMeReplyPrompt => prompt_engine::default_help_me_reply_entries(),
+        PromptType::HelpMeReplyConversationalPrompt => {
+            prompt_engine::default_help_me_reply_conversational_entries()
+        }
+        PromptType::LorebookEntryWriterPrompt => {
+            prompt_engine::default_lorebook_entry_writer_entries()
+        }
+        PromptType::LorebookKeywordGeneratorPrompt => {
+            prompt_engine::default_lorebook_keyword_generator_entries()
+        }
+        PromptType::LorebookGeneratorPlannerPrompt => {
+            prompt_engine::default_lorebook_generator_planner_entries()
+        }
+        PromptType::LorebookGeneratorWriterPrompt => {
+            prompt_engine::default_lorebook_generator_writer_entries()
+        }
+        PromptType::LorebookGeneratorRefinePrompt => {
+            prompt_engine::default_lorebook_generator_refine_entries()
+        }
+        PromptType::LorebookGeneratorCoherencePrompt => {
+            prompt_engine::default_lorebook_generator_coherence_entries()
+        }
+        PromptType::GroupChatPrompt => prompt_engine::default_group_chat_entries(),
+        PromptType::GroupChatRoleplayPrompt => prompt_engine::default_group_chat_roleplay_entries(),
+        PromptType::AvatarGenerationPrompt => prompt_engine::default_avatar_generation_entries(),
+        PromptType::AvatarEditPrompt => prompt_engine::default_avatar_edit_entries(),
+        PromptType::SceneGenerationPrompt => prompt_engine::default_scene_generation_entries(),
+        PromptType::ScenePromptWriterPrompt => prompt_engine::default_scene_prompt_writer_entries(),
+        PromptType::DesignReferencePrompt => prompt_engine::default_design_reference_entries(),
+        PromptType::CompanionSoulWriterPrompt => {
+            prompt_engine::default_companion_soul_writer_entries()
+        }
+        PromptType::CompanionGrowthcyclePrompt => {
+            prompt_engine::default_companion_growthcycle_entries()
+        }
+        PromptType::CompanionConsolidationPrompt => {
+            prompt_engine::default_companion_consolidation_entries()
+        }
+    }
+}
+
+pub fn default_character_rules(pure_mode_level: &str) -> Vec<String> {
+    let mut rules = vec![
+        "Embody the character naturally without breaking immersion".to_string(),
+        "Respond based on your personality, background, and current situation".to_string(),
+        "Show emotions and reactions authentically through your words".to_string(),
+        "Engage with the conversation organically, not like an assistant".to_string(),
+        "You may roleplay as background characters or NPCs in the scene when needed (e.g., if you're a police officer and a witness appears, you can act as that witness). However, NEVER roleplay as the user's character - only control your own character and third-party characters".to_string(),
+    ];
+
+    match pure_mode_level {
+        "off" => {}
+        "low" => {
+            rules.push("Avoid explicit sexual content".to_string());
+        }
+        "strict" => {
+            rules.push(
+                "Never generate sexually explicit, pornographic, or erotic content".to_string(),
+            );
+            rules.push(
+                "Never describe sexual acts, nudity in sexual contexts, or sexual arousal"
+                    .to_string(),
+            );
+            rules.push(
+                "If asked to generate such content, decline and redirect the conversation"
+                    .to_string(),
+            );
+            rules.push(
+                "Romantic content must remain PG-13 — no explicit physical descriptions"
+                    .to_string(),
+            );
+            rules.push("Violence descriptions should avoid gratuitous gore or torture".to_string());
+            rules.push(
+                "Do not use suggestive, flirty, or sexually charged language or tone".to_string(),
+            );
+        }
+        // "standard" and anything else
+        _ => {
+            rules.push(
+                "Never generate sexually explicit, pornographic, or erotic content".to_string(),
+            );
+            rules.push(
+                "Never describe sexual acts, nudity in sexual contexts, or sexual arousal"
+                    .to_string(),
+            );
+            rules.push(
+                "If asked to generate such content, decline and redirect the conversation"
+                    .to_string(),
+            );
+            rules.push(
+                "Romantic content must remain PG-13 — no explicit physical descriptions"
+                    .to_string(),
+            );
+            rules.push("Violence descriptions should avoid gratuitous gore or torture".to_string());
+        }
+    }
+
+    rules
+}
+
+pub fn load_settings(app: &AppHandle) -> Result<Settings, String> {
+    if let Some(settings) = read_settings_typed(app)? {
+        Ok(settings)
+    } else {
+        let defaults = default_settings();
+        write_settings_typed(app, &defaults)?;
+        Ok(defaults)
+    }
+}
+
+pub(crate) fn default_settings() -> Settings {
+    Settings {
+        default_provider_credential_id: None,
+        default_model_id: None,
+        provider_credentials: Vec::new(),
+        models: Vec::new(),
+        app_state: serde_json::Value::Null,
+        advanced_model_settings: AdvancedModelSettings::default(),
+        advanced_settings: Some(AdvancedSettings {
+            llama_default_context_length: None,
+            llama_default_kv_cache_type: None,
+            llama_sampler_presets: None,
+            group_speaker_selection_model_id: None,
+            sd_default_offload_mode: None,
+            sd_default_size: None,
+            summarisation_model_id: None,
+            dynamic_memory_summarizer_prompt_template_id: None,
+            dynamic_memory_manager_prompt_template_id: None,
+            developer_mode_enabled: Some(false),
+            dynamic_memory_structured_fallback_format: Some(
+                DynamicMemoryStructuredFallbackFormat::Xml,
+            ),
+            dynamic_memory_llama_sampler_overwrite_enabled: Some(true),
+            avatar_generation_enabled: Some(true),
+            avatar_generation_model_id: None,
+            scene_generation_enabled: Some(true),
+            scene_generation_mode: Some("auto".to_string()),
+            scene_generation_model_id: None,
+            scene_writer_model_id: None,
+            app_update_checks_enabled: None,
+            creation_helper_enabled: None,
+            creation_helper_model_id: None,
+            creation_helper_streaming: None,
+            creation_helper_image_model_id: None,
+            creation_helper_smart_tool_selection: None,
+            creation_helper_enabled_tools: None,
+            help_me_reply_enabled: None,
+            help_me_reply_model_id: None,
+            help_me_reply_streaming: None,
+            help_me_reply_max_tokens: None,
+            help_me_reply_history_count: None,
+            help_me_reply_style: None,
+            help_me_reply_roleplay_prompt_template_id: None,
+            help_me_reply_conversational_prompt_template_id: None,
+            lorebook_entry_generator_model_id: None,
+            lorebook_entry_generator_structured_fallback_format: Some(
+                DynamicMemoryStructuredFallbackFormat::Json,
+            ),
+            lorebook_entry_generator_prompt_template_id: None,
+            lorebook_keyword_generator_prompt_template_id: None,
+            lorebook_generator_model_id: None,
+            lorebook_generator_structured_fallback_format: Some(
+                DynamicMemoryStructuredFallbackFormat::Json,
+            ),
+            lorebook_generator_default_target_count: Some(12),
+            lorebook_generator_max_tokens: Some(4096),
+            lorebook_generator_planner_prompt_template_id: None,
+            lorebook_generator_writer_prompt_template_id: None,
+            lorebook_generator_refine_prompt_template_id: None,
+            lorebook_generator_coherence_prompt_template_id: None,
+            companion_soul_writer_model_id: None,
+            companion_soul_writer_fallback_model_id: None,
+            companion_soul_writer_prompt_template_id: None,
+            companion_soul_writer_structured_fallback_format: Some(
+                DynamicMemoryStructuredFallbackFormat::Json,
+            ),
+            dynamic_memory: None,
+            group_dynamic_memory: None,
+            manual_mode_context_window: None,
+            embedding_max_tokens: None,
+            embedding_model_version: None,
+            embedding_dimensions: None,
+            embedding_keep_model_loaded: None,
+            host_api: None,
+            accessibility: Some(AccessibilitySettings {
+                send: AccessibilitySoundSettings {
+                    enabled: false,
+                    volume: 0.5,
+                },
+                success: AccessibilitySoundSettings {
+                    enabled: false,
+                    volume: 0.6,
+                },
+                failure: AccessibilitySoundSettings {
+                    enabled: false,
+                    volume: 0.6,
+                },
+            }),
+            navigation_style: None,
+            navigation_side: None,
+            header_style: None,
+            nav_items: None,
+            nav_align: None,
+            nav_edge: None,
+            chat_appearance: None,
+        }),
+        prompt_template_id: None,
+        system_prompt: None,
+        migration_version: 0,
+    }
+}
+
+pub fn load_characters(app: &AppHandle) -> Result<Vec<Character>, String> {
+    characters_list_typed(app)
+}
+
+pub fn load_personas(app: &AppHandle) -> Result<Vec<Persona>, String> {
+    personas_list_typed(app)
+}
+
+pub fn load_session(app: &AppHandle, session_id: &str) -> Result<Option<Session>, String> {
+    let Some(mut session) = session_get_meta_internal(app, session_id)? else {
+        return Ok(None);
+    };
+
+    let owner =
+        crate::storage_manager::companion_shared_memory::resolve_effective_memory_owner_for_session_app(
+            app,
+            session_id,
+        )?;
+    let new_table_count =
+        memory_embeddings::count_for_session_app(app, &owner.owner_id, owner.kind).unwrap_or(0);
+    if new_table_count > 0 {
+        session.memory_embeddings =
+            memory_embeddings::load_for_session_app(app, &owner.owner_id, owner.kind)?;
+    }
+
+    let recent = messages_list_internal(app, session_id, 120, None, None)?;
+    let pinned = messages_list_pinned_internal(app, session_id)?;
+
+    let mut by_id = std::collections::HashMap::<String, StoredMessage>::new();
+    for m in pinned.into_iter().chain(recent.into_iter()) {
+        by_id.insert(m.id.clone(), m);
+    }
+    let mut merged: Vec<StoredMessage> = by_id.into_values().collect();
+    merged.sort_by(|a, b| {
+        a.created_at
+            .cmp(&b.created_at)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    session.messages = merged;
+    Ok(Some(session))
+}
+
+pub fn save_session(app: &AppHandle, session: &Session) -> Result<(), String> {
+    let owner =
+        crate::storage_manager::companion_shared_memory::resolve_effective_memory_owner_for_session_app(
+            app,
+            &session.id,
+        )?;
+    memory_embeddings::replace_all_app(
+        app,
+        &owner.owner_id,
+        owner.kind,
+        &session.memory_embeddings,
+    )?;
+
+    let mut meta = session.clone();
+    meta.messages = Vec::new();
+    if !owner.shared {
+        meta.memory_embeddings = Vec::new();
+    }
+
+    if let Some(state_obj) = meta
+        .companion_state
+        .as_mut()
+        .and_then(|value| value.as_object_mut())
+    {
+        if let Ok(Some(persisted)) = session_get_meta_internal(app, &session.id) {
+            if let Some(prefs) = persisted
+                .companion_state
+                .as_ref()
+                .and_then(|value| value.get("preferences"))
+                .cloned()
+            {
+                state_obj.insert("preferences".to_string(), prefs);
+            }
+        }
+    }
+
+    session_upsert_meta_internal(app, &meta)?;
+
+    if let Some(last) = session.messages.last() {
+        messages_upsert_batch_internal(app, &session.id, std::slice::from_ref(last))?;
+    }
+    Ok(())
+}
+
+pub fn select_model_with_credential<'a>(
+    settings: &'a Settings,
+    character: &Character,
+    model_override: Option<&str>,
+) -> Result<(&'a Model, &'a ProviderCredential), String> {
+    let model_id = model_override
+        .map(str::to_string)
+        .or_else(|| character.default_model_id.clone())
+        .or_else(|| settings.default_model_id.clone())
+        .ok_or_else(|| "No default model configured".to_string())?;
+
+    let model = settings
+        .models
+        .iter()
+        .find(|m| m.id == model_id)
+        .ok_or_else(|| "Model not found".to_string())?;
+
+    let credential = resolve_credential_for_model(settings, model)
+        .ok_or_else(|| "Provider credential not found".to_string())?;
+
+    Ok((model, credential))
+}
+
+pub fn resolve_credential_for_model<'a>(
+    settings: &'a Settings,
+    model: &Model,
+) -> Option<&'a ProviderCredential> {
+    if model.provider_id.eq_ignore_ascii_case("llamacpp") {
+        static LLAMA_CPP_CREDENTIAL: OnceLock<ProviderCredential> = OnceLock::new();
+        return Some(LLAMA_CPP_CREDENTIAL.get_or_init(|| ProviderCredential {
+            id: "builtin-llamacpp".to_string(),
+            provider_id: "llamacpp".to_string(),
+            label: "llama.cpp (Local)".to_string(),
+            api_key: Some(String::new()),
+            base_url: None,
+            default_model: None,
+            headers: None,
+            config: None,
+        }));
+    }
+
+    if let Some(model_cred_id) = model.provider_credential_id.as_ref() {
+        if let Some(explicit_match) = settings
+            .provider_credentials
+            .iter()
+            .find(|cred| &cred.id == model_cred_id && cred.provider_id == model.provider_id)
+        {
+            return Some(explicit_match);
+        }
+    }
+
+    let candidates: Vec<&ProviderCredential> = settings
+        .provider_credentials
+        .iter()
+        .filter(|cred| cred.provider_id == model.provider_id)
+        .collect();
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    if let Some(default_cred_id) = settings.default_provider_credential_id.as_ref() {
+        if let Some(default_match) = candidates
+            .iter()
+            .copied()
+            .find(|cred| &cred.id == default_cred_id)
+        {
+            return Some(default_match);
+        }
+    }
+
+    if candidates.len() == 1 {
+        return candidates.first().copied();
+    }
+
+    if !model.provider_label.trim().is_empty() {
+        if let Some(label_match) = candidates
+            .iter()
+            .copied()
+            .find(|cred| cred.label == model.provider_label)
+        {
+            return Some(label_match);
+        }
+    }
+
+    if let Some(default_model_match) = candidates
+        .iter()
+        .copied()
+        .find(|cred| cred.default_model.as_deref() == Some(model.name.as_str()))
+    {
+        return Some(default_model_match);
+    }
+
+    // Multiple credentials exist for the same provider type and none matched.
+    // Returning None avoids silently routing to the wrong endpoint.
+    None
+}
+
+pub fn choose_persona<'a>(
+    personas: &'a [Persona],
+    explicit: Option<&String>,
+) -> Option<&'a Persona> {
+    if let Some(id) = explicit {
+        if id.is_empty() {
+            return None;
+        }
+        if let Some(p) = personas.iter().find(|p| &p.id == id) {
+            return Some(p);
+        }
+    }
+    personas.iter().find(|p| p.is_default)
+}
+
+pub fn build_system_prompt(
+    app: &AppHandle,
+    character: &Character,
+    model: &Model,
+    persona: Option<&Persona>,
+    session: &Session,
+    settings: &Settings,
+) -> Vec<SystemPromptEntry> {
+    prompt_engine::build_system_prompt_entries(app, character, model, persona, session, settings)
+}
+
+pub fn recent_messages(session: &Session, limit: usize) -> Vec<StoredMessage> {
+    let mut recent_msgs: Vec<StoredMessage> =
+        session.messages.iter().rev().take(limit).cloned().collect();
+    recent_msgs.reverse();
+    recent_msgs
+}

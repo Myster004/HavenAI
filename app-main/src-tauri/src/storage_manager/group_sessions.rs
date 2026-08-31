@@ -1,0 +1,4022 @@
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use tauri::{AppHandle, Manager, State};
+use uuid::Uuid;
+
+use super::db::{now_ms, SwappablePool};
+use crate::dynamic_memory_run_manager::DynamicMemoryRunManager;
+use crate::storage_manager::lorebook::Lorebook;
+use crate::utils::{log_info, log_info_global};
+
+pub fn group_session_get_internal(conn: &Connection, id: &str) -> Result<String, String> {
+    match read_group_session(conn, id)? {
+        Some(session) => serde_json::to_string(&session)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e)),
+        None => Err(crate::utils::err_msg(
+            module_path!(),
+            line!(),
+            "Session not found",
+        )),
+    }
+}
+
+pub fn group_session_get_internal_typed(
+    conn: &Connection,
+    id: &str,
+) -> Result<GroupSession, String> {
+    read_group_session(conn, id)?
+        .ok_or_else(|| crate::utils::err_msg(module_path!(), line!(), "Session not found"))
+}
+
+pub fn group_participation_stats_internal(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<String, String> {
+    let stats = read_group_participation(conn, session_id)?;
+    serde_json::to_string(&stats)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))
+}
+
+pub fn group_participation_stats_internal_typed(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<GroupParticipation>, String> {
+    read_group_participation(conn, session_id)
+}
+
+pub fn group_messages_list_internal(
+    conn: &Connection,
+    session_id: &str,
+    limit: i32,
+    before_created_at: Option<i64>,
+    before_id: Option<&str>,
+) -> Result<String, String> {
+    let messages = read_group_messages(conn, session_id, limit, before_created_at, before_id)?;
+    serde_json::to_string(&messages)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))
+}
+
+pub fn group_messages_list_internal_typed(
+    conn: &Connection,
+    session_id: &str,
+    limit: i32,
+    before_created_at: Option<i64>,
+    before_id: Option<&str>,
+) -> Result<Vec<GroupMessage>, String> {
+    read_group_messages(conn, session_id, limit, before_created_at, before_id)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupSession {
+    pub id: String,
+    #[serde(default)]
+    pub group_character_id: Option<String>,
+    pub name: String,
+    pub character_ids: Vec<String>,
+    #[serde(default)]
+    pub muted_character_ids: Vec<String>,
+    pub persona_id: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    /// Whether this session is archived
+    #[serde(default)]
+    pub archived: bool,
+    /// Chat type: "conversation" or "roleplay"
+    #[serde(default = "default_chat_type")]
+    pub chat_type: String,
+    /// Starting scene for roleplay chats (JSON-encoded scene data)
+    #[serde(default)]
+    pub starting_scene: Option<serde_json::Value>,
+    /// Background image path for the group chat
+    #[serde(default)]
+    pub background_image_path: Option<String>,
+    #[serde(default)]
+    pub lorebook_ids: Vec<String>,
+    #[serde(default)]
+    pub disable_character_lorebooks: bool,
+    /// Manual memories (simple text entries)
+    #[serde(default)]
+    pub memories: Vec<String>,
+    /// Dynamic memory embeddings with semantic search support
+    #[serde(default)]
+    pub memory_embeddings: Vec<MemoryEmbedding>,
+    /// Summary of memories for context compression
+    #[serde(default)]
+    pub memory_summary: String,
+    /// Token count of the memory summary
+    #[serde(default)]
+    pub memory_summary_token_count: i32,
+    /// Memory tool events tracking (for dynamic memory cycle gating)
+    #[serde(default)]
+    pub memory_tool_events: Vec<serde_json::Value>,
+    /// Dynamic memory processing state
+    #[serde(default = "default_memory_status")]
+    pub memory_status: String,
+    /// Last dynamic memory error if any
+    #[serde(default)]
+    pub memory_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_progress_step: Option<i32>,
+    /// Speaker selection method: "llm", "heuristic", or "round_robin"
+    #[serde(default = "default_speaker_selection_method")]
+    pub speaker_selection_method: String,
+    /// Memory type: "manual" or "dynamic"
+    #[serde(default = "default_memory_type")]
+    pub memory_type: String,
+    /// Private session-level author note injected into the prompt
+    #[serde(default)]
+    pub author_note: Option<String>,
+    /// Per-character model overrides keyed by character id
+    #[serde(default)]
+    pub character_model_overrides: BTreeMap<String, String>,
+    /// Group system prompt override used for conversation chats
+    #[serde(default)]
+    pub group_chat_prompt_template_id: Option<String>,
+    /// Group system prompt override used for roleplay chats
+    #[serde(default)]
+    pub group_chat_roleplay_prompt_template_id: Option<String>,
+    #[serde(default = "default_group_config_overrides")]
+    pub config_overrides: serde_json::Value,
+}
+
+fn default_group_config_overrides() -> serde_json::Value {
+    serde_json::json!({ "version": 1 })
+}
+
+fn write_group_config_overrides(
+    conn: &Connection,
+    session_id: &str,
+    values: &[(&str, serde_json::Value)],
+) -> Result<(), String> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT config_overrides FROM group_sessions WHERE id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| crate::utils::err_to_string(module_path!(), line!(), error))?;
+    let mut object = raw
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    object.insert("version".to_string(), serde_json::json!(1));
+    for (key, value) in values {
+        object.insert((*key).to_string(), value.clone());
+    }
+    conn.execute(
+        "UPDATE group_sessions SET config_overrides = ?1 WHERE id = ?2",
+        params![serde_json::Value::Object(object).to_string(), session_id],
+    )
+    .map_err(|error| crate::utils::err_to_string(module_path!(), line!(), error))?;
+    Ok(())
+}
+
+struct ResolvedGroupSession(GroupSession);
+
+fn default_chat_type() -> String {
+    "conversation".to_string()
+}
+
+fn default_speaker_selection_method() -> String {
+    "llm".to_string()
+}
+
+fn default_memory_type() -> String {
+    "manual".to_string()
+}
+
+fn default_memory_status() -> String {
+    "idle".to_string()
+}
+
+pub use crate::chat_manager::types::{ImageAttachment, MemoryEmbedding, UsageSummary};
+
+fn read_group_embeddings_with_fallback(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<MemoryEmbedding>, String> {
+    let count = crate::storage_manager::memory_embeddings::count_for_session(
+        conn,
+        session_id,
+        crate::storage_manager::memory_embeddings::SessionKind::GroupSession,
+    )
+    .unwrap_or(0);
+    if count > 0 {
+        return crate::storage_manager::memory_embeddings::load_for_session(
+            conn,
+            session_id,
+            crate::storage_manager::memory_embeddings::SessionKind::GroupSession,
+        );
+    }
+    let json: String = conn
+        .query_row(
+            "SELECT memory_embeddings FROM group_sessions WHERE id = ?",
+            params![session_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?
+        .unwrap_or_else(|| "[]".to_string());
+    Ok(serde_json::from_str(&json).unwrap_or_default())
+}
+
+fn write_group_embeddings_through_table(
+    conn: &mut Connection,
+    session_id: &str,
+    embeddings: &[MemoryEmbedding],
+) -> Result<(), String> {
+    crate::storage_manager::memory_embeddings::replace_all(
+        conn,
+        session_id,
+        crate::storage_manager::memory_embeddings::SessionKind::GroupSession,
+        embeddings,
+    )?;
+    let now = now_ms() as i64;
+    conn.execute(
+        "UPDATE group_sessions SET memory_embeddings = '[]', updated_at = ? WHERE id = ?",
+        params![now, session_id],
+    )
+    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupParticipation {
+    pub id: String,
+    pub session_id: String,
+    pub character_id: String,
+    pub speak_count: i32,
+    pub last_spoke_turn: Option<i32>,
+    pub last_spoke_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupMessage {
+    pub id: String,
+    pub session_id: String,
+    pub role: String,
+    pub content: String,
+    pub speaker_character_id: Option<String>,
+    pub turn_number: i32,
+    pub created_at: i64,
+    pub usage: Option<UsageSummary>,
+    pub variants: Option<Vec<GroupMessageVariant>>,
+    pub selected_variant_id: Option<String>,
+    pub is_pinned: bool,
+    pub attachments: Vec<ImageAttachment>,
+    #[serde(default)]
+    pub used_lorebook_entries: Vec<String>,
+    #[serde(default)]
+    pub memory_refs: Vec<String>,
+    pub reasoning: Option<String>,
+    pub selection_reasoning: Option<String>,
+    pub model_id: Option<String>,
+    #[serde(default)]
+    pub gemini_content: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupMessageVariant {
+    pub id: String,
+    pub content: String,
+    pub speaker_character_id: Option<String>,
+    pub created_at: i64,
+    pub usage: Option<UsageSummary>,
+    pub reasoning: Option<String>,
+    pub selection_reasoning: Option<String>,
+    pub model_id: Option<String>,
+    #[serde(default)]
+    pub attachments: Vec<ImageAttachment>,
+    #[serde(default)]
+    pub gemini_content: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupSessionPreview {
+    pub id: String,
+    #[serde(default)]
+    pub group_character_id: Option<String>,
+    pub name: String,
+    pub character_ids: Vec<String>,
+    pub updated_at: i64,
+    pub last_message: Option<String>,
+    pub message_count: i32,
+    pub archived: bool,
+    pub chat_type: String,
+}
+
+fn read_group_session(conn: &Connection, id: &str) -> Result<Option<GroupSession>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, group_character_id, name, character_ids, muted_character_ids, persona_id, created_at, updated_at,
+                    memories, memory_embeddings, memory_summary, memory_summary_token_count, archived, memory_tool_events,
+                    chat_type, starting_scene, background_image_path, lorebook_ids, disable_character_lorebooks,
+                    speaker_selection_method, memory_type, memory_status, memory_error, memory_progress_step, author_note, config_overrides,
+                    character_model_overrides, group_chat_prompt_template_id, group_chat_roleplay_prompt_template_id
+             FROM group_sessions WHERE id = ?1",
+        )
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    let mut rows = stmt
+        .query(params![id])
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    if let Some(row) = rows
+        .next()
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?
+    {
+        let character_ids_json: String = row
+            .get(3)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+        let character_ids: Vec<String> =
+            serde_json::from_str(&character_ids_json).unwrap_or_default();
+        let muted_character_ids_json: String = row
+            .get::<_, Option<String>>(4)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?
+            .unwrap_or_else(|| "[]".to_string());
+        let mut muted_character_ids: Vec<String> =
+            serde_json::from_str(&muted_character_ids_json).unwrap_or_default();
+        muted_character_ids.retain(|id| character_ids.contains(id));
+
+        let memories_json: String = row
+            .get::<_, Option<String>>(8)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?
+            .unwrap_or_else(|| "[]".to_string());
+        let memories: Vec<String> = serde_json::from_str(&memories_json).unwrap_or_default();
+
+        let memory_embeddings: Vec<MemoryEmbedding> = {
+            let new_table_count = crate::storage_manager::memory_embeddings::count_for_session(
+                conn,
+                id,
+                crate::storage_manager::memory_embeddings::SessionKind::GroupSession,
+            )
+            .unwrap_or(0);
+            if new_table_count > 0 {
+                crate::storage_manager::memory_embeddings::load_for_session(
+                    conn,
+                    id,
+                    crate::storage_manager::memory_embeddings::SessionKind::GroupSession,
+                )?
+            } else {
+                let memory_embeddings_json: String = row
+                    .get::<_, Option<String>>(9)
+                    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?
+                    .unwrap_or_else(|| "[]".to_string());
+                serde_json::from_str(&memory_embeddings_json).unwrap_or_default()
+            }
+        };
+
+        let memory_summary: String = row
+            .get::<_, Option<String>>(10)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?
+            .unwrap_or_default();
+        let memory_summary_token_count: i32 = row
+            .get::<_, Option<i32>>(11)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?
+            .unwrap_or(0);
+
+        let archived: bool = row
+            .get::<_, Option<i32>>(12)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?
+            .map(|v| v != 0)
+            .unwrap_or(false);
+
+        let memory_tool_events_json: String = row
+            .get::<_, Option<String>>(13)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?
+            .unwrap_or_else(|| "[]".to_string());
+        let memory_tool_events: Vec<serde_json::Value> =
+            serde_json::from_str(&memory_tool_events_json).unwrap_or_default();
+
+        let chat_type: String = row
+            .get::<_, Option<String>>(14)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?
+            .unwrap_or_else(|| "conversation".to_string());
+
+        let starting_scene_json: Option<String> = row
+            .get(15)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+        let starting_scene: Option<serde_json::Value> =
+            starting_scene_json.and_then(|s| serde_json::from_str(&s).ok());
+
+        let background_image_path: Option<String> = row
+            .get(16)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+        let lorebook_ids_json: String = row
+            .get::<_, Option<String>>(17)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?
+            .unwrap_or_else(|| "[]".to_string());
+        let lorebook_ids: Vec<String> =
+            serde_json::from_str(&lorebook_ids_json).unwrap_or_default();
+        let disable_character_lorebooks: bool = row
+            .get::<_, Option<i64>>(18)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?
+            .map(|v| v != 0)
+            .unwrap_or(false);
+
+        let speaker_selection_method: String = row
+            .get::<_, Option<String>>(19)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?
+            .unwrap_or_else(|| "llm".to_string());
+
+        let memory_type: String = row
+            .get::<_, Option<String>>(20)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?
+            .unwrap_or_else(|| "manual".to_string());
+        let memory_status: String = row
+            .get::<_, Option<String>>(21)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?
+            .unwrap_or_else(|| "idle".to_string());
+        let memory_error: Option<String> = row
+            .get(22)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+        let memory_progress_step: Option<i32> = row
+            .get(23)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+        let author_note: Option<String> = row.get(24).ok().flatten();
+
+        let config_overrides: serde_json::Value = row
+            .get::<_, Option<String>>(25)
+            .ok()
+            .flatten()
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .unwrap_or_else(default_group_config_overrides);
+        let mut character_model_overrides: BTreeMap<String, String> = row
+            .get::<_, Option<String>>(26)
+            .ok()
+            .flatten()
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .unwrap_or_default();
+        character_model_overrides.retain(|cid, _| character_ids.contains(cid));
+        let group_chat_prompt_template_id: Option<String> = row.get(27).ok().flatten();
+        let group_chat_roleplay_prompt_template_id: Option<String> = row.get(28).ok().flatten();
+        let session = GroupSession {
+            id: row
+                .get(0)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            group_character_id: row
+                .get(1)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            name: row
+                .get(2)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            character_ids,
+            muted_character_ids,
+            persona_id: row
+                .get(5)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            created_at: row
+                .get(6)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            updated_at: row
+                .get(7)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            archived,
+            chat_type,
+            starting_scene,
+            background_image_path,
+            lorebook_ids,
+            disable_character_lorebooks,
+            memories,
+            memory_embeddings,
+            memory_summary,
+            memory_summary_token_count,
+            memory_tool_events,
+            memory_status,
+            memory_error,
+            memory_progress_step,
+            speaker_selection_method,
+            memory_type,
+            author_note,
+            character_model_overrides,
+            group_chat_prompt_template_id,
+            group_chat_roleplay_prompt_template_id,
+            config_overrides,
+        };
+        Ok(Some(resolve_group_session_config(conn, session)?.0))
+    } else {
+        Ok(None)
+    }
+}
+
+fn resolve_group_session_config(
+    conn: &Connection,
+    mut session: GroupSession,
+) -> Result<ResolvedGroupSession, String> {
+    let Some(group_id) = session.group_character_id.as_deref() else {
+        return Ok(ResolvedGroupSession(session));
+    };
+    let profile = conn
+        .query_row(
+            "SELECT character_ids, muted_character_ids, persona_id, COALESCE(chat_type, 'conversation'), starting_scene, background_image_path, COALESCE(lorebook_ids, '[]'), COALESCE(disable_character_lorebooks, 0), COALESCE(speaker_selection_method, 'llm'), COALESCE(memory_type, 'manual'), COALESCE(character_model_overrides, '{}'), group_chat_prompt_template_id, group_chat_roleplay_prompt_template_id FROM group_characters WHERE id = ?1",
+            params![group_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                    row.get::<_, Option<String>>(12)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| crate::utils::err_to_string(module_path!(), line!(), error))?;
+    let Some(profile) = profile else {
+        return Ok(ResolvedGroupSession(session));
+    };
+    let overrides = session.config_overrides.as_object();
+    let value = |key: &str| overrides.and_then(|object| object.get(key));
+    let json_array = |override_value: Option<&serde_json::Value>, fallback: &str| {
+        override_value
+            .and_then(|value| {
+                if let Some(raw) = value.as_str() {
+                    serde_json::from_str(raw).ok()
+                } else {
+                    serde_json::from_value(value.clone()).ok()
+                }
+            })
+            .or_else(|| serde_json::from_str(fallback).ok())
+            .unwrap_or_default()
+    };
+    session.character_ids = json_array(value("characterIds"), &profile.0);
+    session.muted_character_ids = json_array(value("mutedCharacterIds"), &profile.1);
+    session
+        .muted_character_ids
+        .retain(|id| session.character_ids.contains(id));
+    session.persona_id = match value("personaId") {
+        Some(value) => value.as_str().map(str::to_string),
+        None => profile.2,
+    };
+    session.chat_type = match value("chatType") {
+        Some(value) => value.as_str().unwrap_or("conversation").to_string(),
+        None => profile.3,
+    };
+    session.starting_scene = match value("startingScene") {
+        Some(value) if value.is_null() => None,
+        Some(serde_json::Value::String(encoded)) => {
+            serde_json::from_str::<serde_json::Value>(encoded)
+                .ok()
+                .filter(|decoded| decoded.is_object())
+        }
+        Some(value) => Some(value.clone()),
+        None => profile.4.and_then(|raw| serde_json::from_str(&raw).ok()),
+    };
+    session.background_image_path = match value("backgroundImagePath") {
+        Some(value) => value.as_str().map(str::to_string),
+        None => profile.5,
+    };
+    session.lorebook_ids = json_array(value("lorebookIds"), &profile.6);
+    session.disable_character_lorebooks = match value("disableCharacterLorebooks") {
+        Some(value) => value.as_bool().unwrap_or(false),
+        None => profile.7 != 0,
+    };
+    session.speaker_selection_method = match value("speakerSelectionMethod") {
+        Some(value) => value.as_str().unwrap_or("llm").to_string(),
+        None => profile.8,
+    };
+    session.memory_type = match value("memoryType") {
+        Some(value) => value.as_str().unwrap_or("manual").to_string(),
+        None => profile.9,
+    };
+    session.character_model_overrides = match value("characterModelOverrides") {
+        Some(value) => serde_json::from_value(value.clone()).unwrap_or_default(),
+        None => serde_json::from_str(&profile.10).unwrap_or_default(),
+    };
+    session
+        .character_model_overrides
+        .retain(|cid, _| session.character_ids.contains(cid));
+    session.group_chat_prompt_template_id = match value("groupChatPromptTemplateId") {
+        Some(value) => value.as_str().map(str::to_string),
+        None => profile.11,
+    };
+    session.group_chat_roleplay_prompt_template_id =
+        match value("groupChatRoleplayPromptTemplateId") {
+            Some(value) => value.as_str().map(str::to_string),
+            None => profile.12,
+        };
+    Ok(ResolvedGroupSession(session))
+}
+
+fn reconcile_stale_group_dynamic_memory_state(
+    app: &tauri::AppHandle,
+    conn: &Connection,
+    session: &mut GroupSession,
+) -> Result<(), String> {
+    if session.memory_status != "processing" {
+        return Ok(());
+    }
+
+    let run_manager = app.state::<DynamicMemoryRunManager>().inner().clone();
+    let run_key = format!("group:{}", session.id);
+    if run_manager.is_run_active(&run_key) {
+        return Ok(());
+    }
+
+    conn.execute(
+        "UPDATE group_sessions SET memory_status = 'idle', memory_error = NULL, updated_at = ?1 WHERE id = ?2",
+        params![now_ms() as i64, session.id],
+    )
+    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    session.memory_status = "idle".to_string();
+    session.memory_error = None;
+    Ok(())
+}
+
+fn read_group_participation(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<GroupParticipation>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, session_id, character_id, speak_count, last_spoke_turn, last_spoke_at
+             FROM group_participation WHERE session_id = ?1",
+        )
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    let mut rows = stmt
+        .query(params![session_id])
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    let mut result = Vec::new();
+
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?
+    {
+        result.push(GroupParticipation {
+            id: row
+                .get(0)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            session_id: row
+                .get(1)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            character_id: row
+                .get(2)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            speak_count: row
+                .get(3)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            last_spoke_turn: row
+                .get(4)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            last_spoke_at: row
+                .get(5)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+        });
+    }
+
+    Ok(result)
+}
+
+fn ensure_participation_records(
+    conn: &Connection,
+    session_id: &str,
+    character_ids: &[String],
+) -> Result<(), String> {
+    for character_id in character_ids {
+        // Check if record exists
+        let exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM group_participation WHERE session_id = ?1 AND character_id = ?2",
+                params![session_id, character_id],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+
+        if !exists {
+            let id = Uuid::new_v4().to_string();
+            conn.execute(
+                "INSERT INTO group_participation (id, session_id, character_id, speak_count, last_spoke_turn, last_spoke_at)
+                 VALUES (?1, ?2, ?3, 0, NULL, NULL)",
+                params![id, session_id, character_id],
+            )
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn read_group_messages(
+    conn: &Connection,
+    session_id: &str,
+    limit: i32,
+    before_created_at: Option<i64>,
+    before_id: Option<&str>,
+) -> Result<Vec<GroupMessage>, String> {
+    let mut messages = Vec::new();
+
+    let (sql, params_vec): (String, Vec<Box<dyn rusqlite::ToSql>>) = match (
+        before_created_at,
+        before_id,
+    ) {
+        (Some(ts), Some(bid)) => (
+            "SELECT id, session_id, role, content, speaker_character_id, turn_number, created_at,
+                    prompt_tokens, completion_tokens, total_tokens, selected_variant_id, is_pinned,
+                    attachments, used_lorebook_entries, reasoning, selection_reasoning, model_id, first_token_ms, tokens_per_second, memory_refs, mtp_stats, gemini_content, usage_json
+             FROM group_messages
+             WHERE session_id = ?1 AND (created_at < ?2 OR (created_at = ?2 AND id < ?3))
+             ORDER BY created_at DESC, id DESC
+             LIMIT ?4"
+                .to_string(),
+            vec![
+                Box::new(session_id.to_string()),
+                Box::new(ts),
+                Box::new(bid.to_string()),
+                Box::new(limit),
+            ],
+        ),
+        _ => (
+            "SELECT id, session_id, role, content, speaker_character_id, turn_number, created_at,
+                    prompt_tokens, completion_tokens, total_tokens, selected_variant_id, is_pinned,
+                    attachments, used_lorebook_entries, reasoning, selection_reasoning, model_id, first_token_ms, tokens_per_second, memory_refs, mtp_stats, gemini_content, usage_json
+             FROM group_messages
+             WHERE session_id = ?1
+             ORDER BY created_at DESC, id DESC
+             LIMIT ?2"
+                .to_string(),
+            vec![Box::new(session_id.to_string()), Box::new(limit)],
+        ),
+    };
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+    let mut rows = stmt
+        .query(params_refs.as_slice())
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?
+    {
+        let message_id: String = row
+            .get(0)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+        let message_id_for_log = message_id.clone();
+        let attachments_json: String = row
+            .get(12)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+        let attachments: Vec<ImageAttachment> =
+            serde_json::from_str(&attachments_json).unwrap_or_default();
+        let used_lorebook_entries_json: String = row
+            .get(13)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+        let used_lorebook_entries: Vec<String> =
+            serde_json::from_str(&used_lorebook_entries_json).unwrap_or_default();
+        let memory_refs_json: Option<String> = row.get(19).ok();
+        let memory_refs: Vec<String> = memory_refs_json
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+
+        let prompt_tokens: Option<u64> = row.get(7).ok();
+        let completion_tokens: Option<u64> = row.get(8).ok();
+        let total_tokens: Option<u64> = row.get(9).ok();
+        let first_token_ms: Option<u64> = row.get(17).ok();
+        let tokens_per_second: Option<f64> = row.get(18).ok();
+        let mtp_stats = row
+            .get::<_, Option<String>>(20)
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str(&s).ok());
+
+        let legacy_usage =
+            if prompt_tokens.is_some() || completion_tokens.is_some() || total_tokens.is_some() {
+                Some(UsageSummary {
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens,
+                    cached_prompt_tokens: None,
+                    cache_write_tokens: None,
+                    reasoning_tokens: None,
+                    image_tokens: None,
+                    audio_tokens: None,
+                    web_search_requests: None,
+                    api_cost: None,
+                    response_id: None,
+                    first_token_ms,
+                    tokens_per_second,
+                    finish_reason: None,
+                    mtp_stats,
+                })
+            } else {
+                None
+            };
+        let usage = row
+            .get::<_, Option<String>>(22)
+            .ok()
+            .flatten()
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .or(legacy_usage);
+
+        // Load variants
+        let variants = load_group_message_variants(conn, &message_id)?;
+
+        messages.push(GroupMessage {
+            id: message_id,
+            session_id: row
+                .get(1)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            role: row
+                .get(2)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            content: row
+                .get(3)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            speaker_character_id: row
+                .get(4)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            turn_number: row
+                .get(5)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            created_at: row
+                .get(6)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            usage,
+            variants: if variants.is_empty() {
+                None
+            } else {
+                Some(variants)
+            },
+            selected_variant_id: row
+                .get(10)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            is_pinned: row
+                .get::<_, i32>(11)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?
+                != 0,
+            attachments,
+            used_lorebook_entries,
+            memory_refs,
+            reasoning: row
+                .get(14)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            selection_reasoning: row
+                .get(15)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            model_id: {
+                let model_id_value: Option<String> = row
+                    .get(16)
+                    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+                log_info_global(
+                    "group_sessions",
+                    format!(
+                        "Read message {} from DB with model_id: {:?}",
+                        message_id_for_log, model_id_value
+                    ),
+                );
+                model_id_value
+            },
+            gemini_content: row
+                .get::<_, Option<String>>(21)
+                .ok()
+                .flatten()
+                .and_then(|value| serde_json::from_str(&value).ok()),
+        });
+    }
+
+    // Reverse to get chronological order
+    messages.reverse();
+    log_info_global(
+        "group_sessions",
+        format!(
+            "Returning {} messages, last message model_id: {:?}",
+            messages.len(),
+            messages.last().and_then(|m| m.model_id.as_ref())
+        ),
+    );
+    Ok(messages)
+}
+
+fn load_group_message_variants(
+    conn: &Connection,
+    message_id: &str,
+) -> Result<Vec<GroupMessageVariant>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, content, speaker_character_id, created_at, prompt_tokens, completion_tokens, total_tokens, reasoning, selection_reasoning, model_id, first_token_ms, tokens_per_second, mtp_stats, attachments, gemini_content, usage_json
+             FROM group_message_variants
+             WHERE message_id = ?1
+             ORDER BY created_at ASC",
+        )
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    let mut rows = stmt
+        .query(params![message_id])
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    let mut variants = Vec::new();
+
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?
+    {
+        let prompt_tokens: Option<u64> = row.get(4).ok();
+        let completion_tokens: Option<u64> = row.get(5).ok();
+        let total_tokens: Option<u64> = row.get(6).ok();
+        let first_token_ms: Option<u64> = row.get(10).ok();
+        let tokens_per_second: Option<f64> = row.get(11).ok();
+        let mtp_stats = row
+            .get::<_, Option<String>>(12)
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str(&s).ok());
+
+        let legacy_usage =
+            if prompt_tokens.is_some() || completion_tokens.is_some() || total_tokens.is_some() {
+                Some(UsageSummary {
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens,
+                    cached_prompt_tokens: None,
+                    cache_write_tokens: None,
+                    reasoning_tokens: None,
+                    image_tokens: None,
+                    audio_tokens: None,
+                    web_search_requests: None,
+                    api_cost: None,
+                    response_id: None,
+                    first_token_ms,
+                    tokens_per_second,
+                    finish_reason: None,
+                    mtp_stats,
+                })
+            } else {
+                None
+            };
+        let usage = row
+            .get::<_, Option<String>>(15)
+            .ok()
+            .flatten()
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .or(legacy_usage);
+
+        variants.push(GroupMessageVariant {
+            id: row
+                .get(0)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            content: row
+                .get(1)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            speaker_character_id: row
+                .get(2)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            created_at: row
+                .get(3)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            usage,
+            reasoning: row
+                .get(7)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            selection_reasoning: row
+                .get(8)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            model_id: row
+                .get(9)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            attachments: row
+                .get::<_, Option<String>>(13)
+                .ok()
+                .flatten()
+                .and_then(|value| serde_json::from_str(&value).ok())
+                .unwrap_or_default(),
+            gemini_content: row
+                .get::<_, Option<String>>(14)
+                .ok()
+                .flatten()
+                .and_then(|value| serde_json::from_str(&value).ok()),
+        });
+    }
+
+    Ok(variants)
+}
+
+fn get_next_turn_number(conn: &Connection, session_id: &str) -> Result<i32, String> {
+    let max_turn: Option<i32> = conn
+        .query_row(
+            "SELECT MAX(turn_number) FROM group_messages WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    Ok(max_turn.unwrap_or(0) + 1)
+}
+
+fn load_lorebooks_for_ids(
+    conn: &Connection,
+    lorebook_ids: &[String],
+) -> Result<Vec<Lorebook>, String> {
+    let mut lorebooks = Vec::new();
+    for lorebook_id in lorebook_ids {
+        if let Some(lorebook) = conn
+            .query_row(
+                "SELECT id, name, avatar_path, keyword_detection_mode, created_at, updated_at FROM lorebooks WHERE id = ?1",
+                params![lorebook_id],
+                |row| {
+                    Ok(Lorebook {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        avatar_path: row.get(2)?,
+                        keyword_detection_mode:
+                            crate::storage_manager::lorebook::LorebookKeywordDetectionMode::from_db_value(
+                                row.get(3)?,
+                            ),
+                        created_at: row.get(4)?,
+                        updated_at: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?
+        {
+            lorebooks.push(lorebook);
+        }
+    }
+    Ok(lorebooks)
+}
+
+#[tauri::command]
+pub fn group_sessions_list(pool: State<'_, SwappablePool>) -> Result<String, String> {
+    let conn = pool.get_connection()?;
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT gs.id, gs.group_character_id, gs.name, gs.character_ids, gs.updated_at,
+                    (SELECT content FROM group_messages WHERE session_id = gs.id ORDER BY created_at DESC LIMIT 1) as last_message,
+                    (SELECT COUNT(*) FROM group_messages WHERE session_id = gs.id) as message_count,
+                    COALESCE(gs.archived, 0) as archived,
+                    COALESCE(gs.chat_type, 'conversation') as chat_type
+             FROM group_sessions gs
+             WHERE COALESCE(gs.archived, 0) = 0
+             ORDER BY gs.updated_at DESC",
+        )
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    let mut rows = stmt
+        .query([])
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    let mut sessions = Vec::new();
+
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?
+    {
+        let character_ids_json: String = row
+            .get(3)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+        let character_ids: Vec<String> =
+            serde_json::from_str(&character_ids_json).unwrap_or_default();
+
+        sessions.push(GroupSessionPreview {
+            id: row
+                .get(0)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            group_character_id: row
+                .get(1)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            name: row
+                .get(2)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            character_ids,
+            updated_at: row
+                .get(4)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            last_message: row
+                .get(5)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            message_count: row
+                .get(6)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            archived: row
+                .get::<_, i32>(7)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?
+                != 0,
+            chat_type: row
+                .get(8)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+        });
+    }
+
+    serde_json::to_string(&sessions)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))
+}
+
+#[tauri::command]
+pub fn group_sessions_list_all(pool: State<'_, SwappablePool>) -> Result<String, String> {
+    let conn = pool.get_connection()?;
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT gs.id, gs.group_character_id, gs.name, gs.character_ids, gs.updated_at,
+                    (SELECT content FROM group_messages WHERE session_id = gs.id ORDER BY created_at DESC LIMIT 1) as last_message,
+                    (SELECT COUNT(*) FROM group_messages WHERE session_id = gs.id) as message_count,
+                    COALESCE(gs.archived, 0) as archived,
+                    COALESCE(gs.chat_type, 'conversation') as chat_type
+             FROM group_sessions gs
+             ORDER BY gs.updated_at DESC",
+        )
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    let mut rows = stmt
+        .query([])
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    let mut sessions = Vec::new();
+
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?
+    {
+        let character_ids_json: String = row
+            .get(3)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+        let character_ids: Vec<String> =
+            serde_json::from_str(&character_ids_json).unwrap_or_default();
+
+        sessions.push(GroupSessionPreview {
+            id: row
+                .get(0)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            group_character_id: row
+                .get(1)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            name: row
+                .get(2)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            character_ids,
+            updated_at: row
+                .get(4)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            last_message: row
+                .get(5)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            message_count: row
+                .get(6)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            archived: row
+                .get::<_, i32>(7)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?
+                != 0,
+            chat_type: row
+                .get(8)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+        });
+    }
+
+    serde_json::to_string(&sessions)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))
+}
+
+/// Archive a group session
+#[tauri::command]
+pub fn group_session_archive(
+    id: String,
+    archived: bool,
+    pool: State<'_, SwappablePool>,
+) -> Result<(), String> {
+    let conn = pool.get_connection()?;
+    let now = now_ms() as i64;
+
+    conn.execute(
+        "UPDATE group_sessions SET archived = ?1, updated_at = ?2 WHERE id = ?3",
+        params![archived, now, id],
+    )
+    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    Ok(())
+}
+
+#[tauri::command]
+pub fn group_session_update_title(
+    id: String,
+    title: String,
+    pool: State<'_, SwappablePool>,
+) -> Result<(), String> {
+    let conn = pool.get_connection()?;
+    let now = now_ms() as i64;
+
+    conn.execute(
+        "UPDATE group_sessions SET name = ?1, updated_at = ?2 WHERE id = ?3",
+        params![title, now, id],
+    )
+    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    Ok(())
+}
+
+#[tauri::command]
+pub fn group_session_duplicate(
+    source_id: String,
+    new_name: Option<String>,
+    pool: State<'_, SwappablePool>,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    let conn = pool.get_connection()?;
+
+    // Read the source session
+    let source = read_group_session(&conn, &source_id)?
+        .ok_or_else(|| "Source session not found".to_string())?;
+
+    let now = now_ms() as i64;
+    let new_id = Uuid::new_v4().to_string();
+    let name = new_name.unwrap_or_else(|| format!("{} (copy)", source.name));
+    let character_ids_json = serde_json::to_string(&source.character_ids)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    let muted_character_ids_json = serde_json::to_string(&source.muted_character_ids)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    let final_persona_id = if source.persona_id.is_none() {
+        super::personas::default_persona_id(app.clone())
+    } else {
+        source.persona_id
+    };
+
+    let chat_type: String = conn
+        .query_row(
+            "SELECT chat_type FROM group_sessions WHERE id = ?1",
+            params![source_id],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|_| "conversation".to_string());
+
+    let starting_scene_json: Option<String> = conn
+        .query_row(
+            "SELECT starting_scene FROM group_sessions WHERE id = ?1",
+            params![source_id],
+            |row| row.get(0),
+        )
+        .ok();
+
+    conn.execute(
+        "INSERT INTO group_sessions (id, group_character_id, name, character_ids, muted_character_ids, persona_id, created_at, updated_at, archived, chat_type, starting_scene, background_image_path, lorebook_ids, disable_character_lorebooks, config_overrides, character_model_overrides, group_chat_prompt_template_id, group_chat_roleplay_prompt_template_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+        params![
+            new_id,
+            source.group_character_id,
+            name,
+            character_ids_json,
+            muted_character_ids_json,
+            final_persona_id,
+            now,
+            chat_type,
+            starting_scene_json,
+            source.background_image_path,
+            serde_json::to_string(&source.lorebook_ids)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            source.disable_character_lorebooks as i64,
+            source.config_overrides.to_string(),
+            serde_json::to_string(&source.character_model_overrides)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            source.group_chat_prompt_template_id,
+            source.group_chat_roleplay_prompt_template_id
+        ],
+    )
+    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    ensure_participation_records(&conn, &new_id, &source.character_ids)?;
+
+    let new_session = read_group_session(&conn, &new_id)?
+        .ok_or_else(|| "Failed to read newly created session".to_string())?;
+
+    serde_json::to_string(&new_session)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))
+}
+
+#[tauri::command]
+pub fn group_session_duplicate_with_messages(
+    source_id: String,
+    new_name: Option<String>,
+    include_messages: bool,
+    pool: State<'_, SwappablePool>,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    let mut conn = pool.get_connection()?;
+
+    let source = read_group_session(&conn, &source_id)?
+        .ok_or_else(|| "Source session not found".to_string())?;
+
+    let now = now_ms() as i64;
+    let new_id = Uuid::new_v4().to_string();
+    let name = new_name.unwrap_or_else(|| format!("{} (copy)", source.name));
+    let character_ids_json = serde_json::to_string(&source.character_ids)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    let muted_character_ids_json = serde_json::to_string(&source.muted_character_ids)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    let final_persona_id = if source.persona_id.is_none() {
+        super::personas::default_persona_id(app.clone())
+    } else {
+        source.persona_id
+    };
+
+    let chat_type: String = conn
+        .query_row(
+            "SELECT chat_type FROM group_sessions WHERE id = ?1",
+            params![source_id],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|_| "conversation".to_string());
+
+    let starting_scene_json: Option<String> = conn
+        .query_row(
+            "SELECT starting_scene FROM group_sessions WHERE id = ?1",
+            params![source_id],
+            |row| row.get(0),
+        )
+        .ok();
+
+    let (
+        memories_json,
+        memory_embeddings_json,
+        memory_summary,
+        memory_summary_token_count,
+        memory_tool_events_json,
+    ) = if include_messages {
+        let memories: Option<String> = conn
+            .query_row(
+                "SELECT memories FROM group_sessions WHERE id = ?1",
+                params![source_id],
+                |row| row.get(0),
+            )
+            .ok();
+
+        let memory_embeddings: Option<String> = conn
+            .query_row(
+                "SELECT memory_embeddings FROM group_sessions WHERE id = ?1",
+                params![source_id],
+                |row| row.get(0),
+            )
+            .ok();
+
+        let memory_summary: String = conn
+            .query_row(
+                "SELECT COALESCE(memory_summary, '') FROM group_sessions WHERE id = ?1",
+                params![source_id],
+                |row| row.get(0),
+            )
+            .unwrap_or_default();
+
+        let memory_summary_token_count: i64 = conn
+            .query_row(
+                "SELECT COALESCE(memory_summary_token_count, 0) FROM group_sessions WHERE id = ?1",
+                params![source_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        let memory_tool_events: Option<String> = conn
+            .query_row(
+                "SELECT memory_tool_events FROM group_sessions WHERE id = ?1",
+                params![source_id],
+                |row| row.get(0),
+            )
+            .ok();
+
+        (
+            memories,
+            memory_embeddings,
+            memory_summary,
+            memory_summary_token_count,
+            memory_tool_events,
+        )
+    } else {
+        (
+            Some("[]".to_string()),
+            Some("[]".to_string()),
+            String::new(),
+            0,
+            Some("[]".to_string()),
+        )
+    };
+
+    let lorebook_ids_json = serde_json::to_string(&source.lorebook_ids)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    let character_model_overrides_json =
+        serde_json::to_string(&source.character_model_overrides)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    let insert_result = conn.execute(
+        "INSERT INTO group_sessions (id, name, character_ids, muted_character_ids, persona_id, created_at, updated_at, archived, chat_type, starting_scene, background_image_path, lorebook_ids, disable_character_lorebooks, memories, memory_embeddings, memory_summary, memory_summary_token_count, memory_tool_events, group_character_id, config_overrides, character_model_overrides, group_chat_prompt_template_id, group_chat_roleplay_prompt_template_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 0, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+        params![
+            new_id,
+            name,
+            character_ids_json,
+            muted_character_ids_json,
+            final_persona_id,
+            now,
+            chat_type,
+            starting_scene_json,
+            source.background_image_path,
+            lorebook_ids_json,
+            source.disable_character_lorebooks as i64,
+            memories_json,
+            memory_embeddings_json,
+            memory_summary,
+            memory_summary_token_count,
+            memory_tool_events_json,
+            source.group_character_id,
+            source.config_overrides.to_string(),
+            character_model_overrides_json,
+            source.group_chat_prompt_template_id,
+            source.group_chat_roleplay_prompt_template_id
+        ],
+    );
+
+    if insert_result.is_err() {
+        conn.execute(
+            "INSERT INTO group_sessions (id, name, character_ids, muted_character_ids, persona_id, created_at, updated_at, archived, chat_type, starting_scene, lorebook_ids, disable_character_lorebooks, memories, memory_embeddings, memory_summary, memory_summary_token_count, memory_tool_events, group_character_id, config_overrides, character_model_overrides, group_chat_prompt_template_id, group_chat_roleplay_prompt_template_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 0, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+            params![
+                new_id,
+                name,
+                character_ids_json,
+                muted_character_ids_json,
+                final_persona_id,
+                now,
+                chat_type,
+                starting_scene_json,
+                lorebook_ids_json,
+                source.disable_character_lorebooks as i64,
+                memories_json,
+                memory_embeddings_json,
+                memory_summary,
+                memory_summary_token_count,
+                memory_tool_events_json,
+                source.group_character_id,
+                source.config_overrides.to_string(),
+                character_model_overrides_json,
+                source.group_chat_prompt_template_id,
+                source.group_chat_roleplay_prompt_template_id
+            ],
+        )
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    }
+
+    ensure_participation_records(&conn, &new_id, &source.character_ids)?;
+
+    if include_messages {
+        let source_embeddings = read_group_embeddings_with_fallback(&conn, &source_id)?;
+        if !source_embeddings.is_empty() {
+            write_group_embeddings_through_table(&mut *conn, &new_id, &source_embeddings)?;
+        }
+    }
+
+    if include_messages {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, role, content, speaker_character_id, turn_number, created_at, is_pinned, attachments
+                 FROM group_messages
+                 WHERE session_id = ?1
+                 ORDER BY turn_number, created_at",
+            )
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+        let messages: Vec<(
+            String,
+            String,
+            String,
+            Option<String>,
+            i64,
+            i64,
+            i64,
+            String,
+        )> = stmt
+            .query_map(params![source_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            })
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+        for (
+            _old_id,
+            role,
+            content,
+            speaker_character_id,
+            turn_number,
+            created_at,
+            is_pinned,
+            attachments,
+        ) in messages
+        {
+            let new_message_id = Uuid::new_v4().to_string();
+            conn.execute(
+                "INSERT INTO group_messages (id, session_id, role, content, speaker_character_id, turn_number, created_at, is_pinned, attachments)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    new_message_id,
+                    new_id,
+                    role,
+                    content,
+                    speaker_character_id,
+                    turn_number,
+                    created_at,
+                    is_pinned,
+                    attachments
+                ],
+            )
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+        }
+    }
+
+    let new_session = read_group_session(&conn, &new_id)?
+        .ok_or_else(|| "Failed to read newly created session".to_string())?;
+
+    serde_json::to_string(&new_session)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))
+}
+
+#[tauri::command]
+pub fn group_session_branch_to_character(
+    source_id: String,
+    character_id: String,
+    new_name: Option<String>,
+    pool: State<'_, SwappablePool>,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    let mut conn = pool.get_connection()?;
+
+    let source = read_group_session(&conn, &source_id)?
+        .ok_or_else(|| "Source session not found".to_string())?;
+
+    if !source.character_ids.contains(&character_id) {
+        return Err(crate::utils::err_msg(
+            module_path!(),
+            line!(),
+            "Character not found in group session",
+        ));
+    }
+
+    let character_name: String = conn
+        .query_row(
+            "SELECT name FROM characters WHERE id = ?1",
+            params![character_id],
+            |row| row.get(0),
+        )
+        .map_err(|_| "Character not found".to_string())?;
+
+    let mut character_names = std::collections::HashMap::new();
+    for char_id in &source.character_ids {
+        if let Ok(name) = conn.query_row(
+            "SELECT name FROM characters WHERE id = ?1",
+            params![char_id],
+            |row| row.get::<_, String>(0),
+        ) {
+            character_names.insert(char_id.clone(), name);
+        }
+    }
+
+    let now = now_ms() as i64;
+    let new_session_id = Uuid::new_v4().to_string();
+    let name = new_name.unwrap_or_else(|| format!("{} - {}", source.name, character_name));
+    let memories_json = serde_json::to_string(&source.memories)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    let memory_embeddings_json = "[]";
+    let memory_tool_events_json = serde_json::to_string(&source.memory_tool_events)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    conn.execute(
+        "INSERT INTO sessions (
+            id, character_id, persona_id, title, memories, memory_embeddings, memory_summary,
+            memory_summary_token_count, memory_tool_events, memory_status, memory_error,
+            memory_progress_step, created_at, updated_at, archived
+         )
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13, 0)",
+        params![
+            new_session_id,
+            character_id,
+            source.persona_id,
+            name,
+            memories_json,
+            memory_embeddings_json,
+            source.memory_summary,
+            source.memory_summary_token_count,
+            memory_tool_events_json,
+            source.memory_status,
+            source.memory_error,
+            source.memory_progress_step,
+            now
+        ],
+    )
+    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    if !source.memory_embeddings.is_empty() {
+        crate::storage_manager::memory_embeddings::replace_all(
+            &mut *conn,
+            &new_session_id,
+            crate::storage_manager::memory_embeddings::SessionKind::Session,
+            &source.memory_embeddings,
+        )?;
+    }
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT role, content, speaker_character_id, turn_number, created_at, is_pinned
+             FROM group_messages
+             WHERE session_id = ?1
+             ORDER BY turn_number, created_at",
+        )
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    let messages: Vec<(String, String, Option<String>, i64, i64, i64)> = stmt
+        .query_map(params![source_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    for (role, content, _speaker_character_id, _turn_number, created_at, is_pinned) in messages {
+        let new_message_id = Uuid::new_v4().to_string();
+
+        let new_role = if role == "assistant" {
+            "assistant"
+        } else {
+            role.as_str()
+        };
+
+        let mut processed_content = content.clone();
+        for char_name in character_names.values() {
+            let placeholder = format!("{{{{@\"{}\"}}}}", char_name);
+            processed_content = processed_content.replace(&placeholder, char_name);
+        }
+
+        conn.execute(
+            "INSERT INTO messages (id, session_id, role, content, created_at, is_pinned, attachments)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, '[]')",
+            params![
+                new_message_id,
+                new_session_id,
+                new_role,
+                processed_content,
+                created_at,
+                is_pinned
+            ],
+        )
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    }
+
+    let session_json = super::sessions::session_get(app, new_session_id)?
+        .ok_or_else(|| "Failed to read newly created session".to_string())?;
+
+    Ok(session_json)
+}
+
+#[tauri::command]
+pub fn group_session_create(
+    name: String,
+    character_ids_json: String,
+    persona_id: Option<String>,
+    chat_type: Option<String>,
+    starting_scene_json: Option<String>,
+    background_image_path: Option<String>,
+    speaker_selection_method: Option<String>,
+    app: tauri::AppHandle,
+    pool: State<'_, SwappablePool>,
+) -> Result<String, String> {
+    let conn = pool.get_connection()?;
+    let now = now_ms() as i64;
+    let id = Uuid::new_v4().to_string();
+
+    let character_ids: Vec<String> = serde_json::from_str(&character_ids_json)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    let final_persona_id = if persona_id.is_none() {
+        super::personas::default_persona_id(app.clone())
+    } else {
+        persona_id
+    };
+
+    let chat_type_value = chat_type.unwrap_or_else(|| "conversation".to_string());
+    let selection_method = speaker_selection_method.unwrap_or_else(|| "llm".to_string());
+    let starting_scene_parsed: Option<serde_json::Value> = starting_scene_json
+        .as_ref()
+        .and_then(|s| serde_json::from_str(s).ok());
+
+    let group_id = Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO group_characters (id, name, character_ids, muted_character_ids, persona_id, created_at, updated_at, archived, chat_type, starting_scene, background_image_path, lorebook_ids, disable_character_lorebooks, speaker_selection_method, memory_type)
+         VALUES (?1, ?2, ?3, '[]', ?4, ?5, ?5, 0, ?6, ?7, ?8, '[]', 0, ?9, 'manual')",
+        params![
+            group_id,
+            name,
+            character_ids_json,
+            final_persona_id,
+            now,
+            chat_type_value,
+            starting_scene_json.as_deref(),
+            background_image_path,
+            selection_method
+        ],
+    )
+    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    conn.execute(
+        "INSERT INTO group_sessions (id, group_character_id, name, character_ids, muted_character_ids, persona_id, created_at, updated_at, archived, chat_type, starting_scene, background_image_path, lorebook_ids, disable_character_lorebooks, speaker_selection_method)
+         VALUES (?1, ?2, ?3, ?4, '[]', ?5, ?6, ?6, 0, ?7, ?8, ?9, '[]', 0, ?10)",
+        params![
+            id,
+            group_id,
+            name,
+            character_ids_json,
+            final_persona_id,
+            now,
+            chat_type_value,
+            starting_scene_json.as_deref(),
+            background_image_path,
+            selection_method
+        ],
+    )
+    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    ensure_participation_records(&conn, &id, &character_ids)?;
+
+    if chat_type_value == "roleplay" {
+        if let Some(ref scene_value) = starting_scene_parsed {
+            if let Some(content) = scene_value.get("content").and_then(|v| v.as_str()) {
+                if !content.trim().is_empty() {
+                    let scene_message_id = Uuid::new_v4().to_string();
+                    conn.execute(
+                        "INSERT INTO group_messages (id, session_id, role, content, speaker_character_id, turn_number, created_at, is_pinned, attachments)
+                         VALUES (?1, ?2, 'scene', ?3, NULL, 0, ?4, 0, '[]')",
+                        params![scene_message_id, id, content, now],
+                    )
+                    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+                }
+            }
+        }
+    }
+
+    let session = GroupSession {
+        id: id.clone(),
+        group_character_id: Some(group_id),
+        name,
+        character_ids,
+        muted_character_ids: Vec::new(),
+        persona_id: final_persona_id,
+        created_at: now as i64,
+        updated_at: now as i64,
+        archived: false,
+        chat_type: chat_type_value,
+        starting_scene: starting_scene_parsed,
+        background_image_path,
+        lorebook_ids: Vec::new(),
+        disable_character_lorebooks: false,
+        memories: Vec::new(),
+        memory_embeddings: Vec::new(),
+        memory_summary: String::new(),
+        memory_summary_token_count: 0,
+        memory_tool_events: Vec::new(),
+        memory_status: "idle".to_string(),
+        memory_error: None,
+        memory_progress_step: None,
+        speaker_selection_method: selection_method,
+        memory_type: "manual".to_string(),
+        author_note: None,
+        character_model_overrides: BTreeMap::new(),
+        group_chat_prompt_template_id: None,
+        group_chat_roleplay_prompt_template_id: None,
+        config_overrides: default_group_config_overrides(),
+    };
+
+    serde_json::to_string(&session)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))
+}
+
+#[tauri::command]
+pub fn group_session_get(
+    app: AppHandle,
+    id: String,
+    pool: State<'_, SwappablePool>,
+) -> Result<String, String> {
+    let conn = pool.get_connection()?;
+
+    match read_group_session(&conn, &id)? {
+        Some(mut session) => {
+            reconcile_stale_group_dynamic_memory_state(&app, &conn, &mut session)?;
+            serde_json::to_string(&session)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))
+        }
+        None => Ok("null".to_string()),
+    }
+}
+
+#[tauri::command]
+pub fn group_session_lorebooks_list(
+    session_id: String,
+    pool: State<'_, SwappablePool>,
+) -> Result<String, String> {
+    let conn = pool.get_connection()?;
+    let session = read_group_session(&conn, &session_id)?
+        .ok_or_else(|| crate::utils::err_msg(module_path!(), line!(), "Session not found"))?;
+    let lorebooks = load_lorebooks_for_ids(&conn, &session.lorebook_ids)?;
+    serde_json::to_string(&lorebooks)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))
+}
+
+#[tauri::command]
+pub fn group_session_lorebooks_set(
+    app: AppHandle,
+    session_id: String,
+    lorebook_ids_json: String,
+    pool: State<'_, SwappablePool>,
+) -> Result<String, String> {
+    let conn = pool.get_connection()?;
+    let now = now_ms() as i64;
+    let lorebook_ids: Vec<String> = serde_json::from_str(&lorebook_ids_json)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    let lorebook_ids_json = serde_json::to_string(&lorebook_ids)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    conn.execute(
+        "UPDATE group_sessions SET lorebook_ids = ?1, updated_at = ?2 WHERE id = ?3",
+        params![lorebook_ids_json, now, session_id],
+    )
+    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    write_group_config_overrides(
+        &conn,
+        &session_id,
+        &[("lorebookIds", serde_json::json!(lorebook_ids))],
+    )?;
+    group_session_get(app, session_id, pool)
+}
+
+#[tauri::command]
+pub fn group_session_update_disable_character_lorebooks(
+    app: AppHandle,
+    session_id: String,
+    disable_character_lorebooks: bool,
+    pool: State<'_, SwappablePool>,
+) -> Result<String, String> {
+    let conn = pool.get_connection()?;
+    let now = now_ms() as i64;
+    conn.execute(
+        "UPDATE group_sessions SET disable_character_lorebooks = ?1, updated_at = ?2 WHERE id = ?3",
+        params![disable_character_lorebooks as i64, now, session_id],
+    )
+    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    write_group_config_overrides(
+        &conn,
+        &session_id,
+        &[(
+            "disableCharacterLorebooks",
+            serde_json::json!(disable_character_lorebooks),
+        )],
+    )?;
+    group_session_get(app, session_id, pool)
+}
+
+#[tauri::command]
+pub fn group_session_update(
+    id: String,
+    name: String,
+    character_ids_json: String,
+    persona_id: Option<String>,
+    pool: State<'_, SwappablePool>,
+) -> Result<String, String> {
+    let conn = pool.get_connection()?;
+    let now = now_ms() as i64;
+
+    let character_ids: Vec<String> = serde_json::from_str(&character_ids_json)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    let existing =
+        read_group_session(&conn, &id)?.ok_or_else(|| "Session not found".to_string())?;
+    let mut muted_character_ids = existing.muted_character_ids;
+    muted_character_ids.retain(|cid| character_ids.contains(cid));
+    let muted_character_ids_json = serde_json::to_string(&muted_character_ids)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    conn.execute(
+        "UPDATE group_sessions SET name = ?1, character_ids = ?2, muted_character_ids = ?3, persona_id = ?4, lorebook_ids = ?5, disable_character_lorebooks = ?6, updated_at = ?7 WHERE id = ?8",
+        params![
+            name,
+            character_ids_json,
+            muted_character_ids_json,
+            persona_id,
+            serde_json::to_string(&existing.lorebook_ids)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            existing.disable_character_lorebooks as i64,
+            now,
+            id
+        ],
+    )
+    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    write_group_config_overrides(
+        &conn,
+        &id,
+        &[
+            ("characterIds", serde_json::json!(character_ids)),
+            ("mutedCharacterIds", serde_json::json!(muted_character_ids)),
+            ("personaId", serde_json::json!(persona_id)),
+        ],
+    )?;
+
+    ensure_participation_records(&conn, &id, &character_ids)?;
+
+    match read_group_session(&conn, &id)? {
+        Some(session) => serde_json::to_string(&session)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e)),
+        None => Err(crate::utils::err_msg(
+            module_path!(),
+            line!(),
+            "Session not found",
+        )),
+    }
+}
+
+#[tauri::command]
+pub fn group_session_delete(id: String, pool: State<'_, SwappablePool>) -> Result<(), String> {
+    let mut conn = pool.get_connection()?;
+    let tx = conn
+        .transaction()
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    crate::storage_manager::memory_embeddings::delete_all_for_session(
+        &tx,
+        &id,
+        crate::storage_manager::memory_embeddings::SessionKind::GroupSession,
+    )?;
+
+    tx.execute("DELETE FROM group_sessions WHERE id = ?1", params![id])
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    tx.commit()
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    Ok(())
+}
+
+#[tauri::command]
+pub fn group_session_add_character(
+    session_id: String,
+    character_id: String,
+    pool: State<'_, SwappablePool>,
+) -> Result<String, String> {
+    let conn = pool.get_connection()?;
+    let now = now_ms() as i64;
+
+    // Get current character_ids
+    let session =
+        read_group_session(&conn, &session_id)?.ok_or_else(|| "Session not found".to_string())?;
+
+    let mut character_ids = session.character_ids;
+    if !character_ids.contains(&character_id) {
+        character_ids.push(character_id.clone());
+    }
+
+    let character_ids_json = serde_json::to_string(&character_ids)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    conn.execute(
+        "UPDATE group_sessions SET character_ids = ?1, updated_at = ?2 WHERE id = ?3",
+        params![character_ids_json, now, session_id],
+    )
+    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    write_group_config_overrides(
+        &conn,
+        &session_id,
+        &[("characterIds", serde_json::json!(character_ids))],
+    )?;
+
+    // Ensure participation record exists
+    ensure_participation_records(&conn, &session_id, &[character_id])?;
+
+    match read_group_session(&conn, &session_id)? {
+        Some(session) => serde_json::to_string(&session)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e)),
+        None => Err(crate::utils::err_msg(
+            module_path!(),
+            line!(),
+            "Session not found",
+        )),
+    }
+}
+
+#[tauri::command]
+pub fn group_session_remove_character(
+    session_id: String,
+    character_id: String,
+    pool: State<'_, SwappablePool>,
+) -> Result<String, String> {
+    let conn = pool.get_connection()?;
+    let now = now_ms() as i64;
+
+    // Get current character_ids
+    let session =
+        read_group_session(&conn, &session_id)?.ok_or_else(|| "Session not found".to_string())?;
+
+    let character_ids: Vec<String> = session
+        .character_ids
+        .into_iter()
+        .filter(|id| id != &character_id)
+        .collect();
+    let muted_character_ids: Vec<String> = session
+        .muted_character_ids
+        .into_iter()
+        .filter(|id| id != &character_id)
+        .collect();
+
+    let character_ids_json = serde_json::to_string(&character_ids)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    let muted_character_ids_json = serde_json::to_string(&muted_character_ids)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    conn.execute(
+        "UPDATE group_sessions SET character_ids = ?1, muted_character_ids = ?2, updated_at = ?3 WHERE id = ?4",
+        params![character_ids_json, muted_character_ids_json, now, session_id],
+    )
+    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    write_group_config_overrides(
+        &conn,
+        &session_id,
+        &[
+            ("characterIds", serde_json::json!(character_ids)),
+            ("mutedCharacterIds", serde_json::json!(muted_character_ids)),
+        ],
+    )?;
+
+    match read_group_session(&conn, &session_id)? {
+        Some(session) => serde_json::to_string(&session)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e)),
+        None => Err(crate::utils::err_msg(
+            module_path!(),
+            line!(),
+            "Session not found",
+        )),
+    }
+}
+
+#[tauri::command]
+pub fn group_session_update_starting_scene(
+    session_id: String,
+    starting_scene_json: Option<String>,
+    pool: State<'_, SwappablePool>,
+) -> Result<String, String> {
+    let conn = pool.get_connection()?;
+    let now = now_ms() as i64;
+
+    conn.execute(
+        "UPDATE group_sessions SET starting_scene = ?1, updated_at = ?2 WHERE id = ?3",
+        params![starting_scene_json, now, session_id],
+    )
+    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    let starting_scene = starting_scene_json
+        .as_deref()
+        .and_then(|value| serde_json::from_str(value).ok())
+        .unwrap_or(serde_json::Value::Null);
+    write_group_config_overrides(&conn, &session_id, &[("startingScene", starting_scene)])?;
+
+    match read_group_session(&conn, &session_id)? {
+        Some(session) => serde_json::to_string(&session)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e)),
+        None => Err(crate::utils::err_msg(
+            module_path!(),
+            line!(),
+            "Session not found",
+        )),
+    }
+}
+
+#[tauri::command]
+pub fn group_session_update_background_image(
+    session_id: String,
+    background_image_path: Option<String>,
+    pool: State<'_, SwappablePool>,
+) -> Result<String, String> {
+    let conn = pool.get_connection()?;
+    let now = now_ms() as i64;
+
+    conn.execute(
+        "UPDATE group_sessions SET background_image_path = ?1, updated_at = ?2 WHERE id = ?3",
+        params![background_image_path, now, session_id],
+    )
+    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    write_group_config_overrides(
+        &conn,
+        &session_id,
+        &[(
+            "backgroundImagePath",
+            serde_json::json!(background_image_path),
+        )],
+    )?;
+
+    match read_group_session(&conn, &session_id)? {
+        Some(session) => serde_json::to_string(&session)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e)),
+        None => Err(crate::utils::err_msg(
+            module_path!(),
+            line!(),
+            "Session not found",
+        )),
+    }
+}
+
+#[tauri::command]
+pub fn group_session_update_chat_type(
+    session_id: String,
+    chat_type: String,
+    pool: State<'_, SwappablePool>,
+) -> Result<String, String> {
+    let conn = pool.get_connection()?;
+    let now = now_ms() as i64;
+
+    // Validate chat_type
+    if chat_type != "conversation" && chat_type != "roleplay" {
+        return Err(crate::utils::err_msg(
+            module_path!(),
+            line!(),
+            "Invalid chat_type. Must be 'conversation' or 'roleplay'",
+        ));
+    }
+
+    conn.execute(
+        "UPDATE group_sessions SET chat_type = ?1, updated_at = ?2 WHERE id = ?3",
+        params![chat_type, now, session_id],
+    )
+    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    write_group_config_overrides(
+        &conn,
+        &session_id,
+        &[("chatType", serde_json::json!(chat_type))],
+    )?;
+
+    match read_group_session(&conn, &session_id)? {
+        Some(session) => serde_json::to_string(&session)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e)),
+        None => Err(crate::utils::err_msg(
+            module_path!(),
+            line!(),
+            "Session not found",
+        )),
+    }
+}
+
+#[tauri::command]
+pub fn group_session_update_author_note(
+    session_id: String,
+    author_note: Option<String>,
+    pool: State<'_, SwappablePool>,
+) -> Result<String, String> {
+    let conn = pool.get_connection()?;
+    let now = now_ms() as i64;
+    let author_note = author_note
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    conn.execute(
+        "UPDATE group_sessions SET author_note = ?1, updated_at = ?2 WHERE id = ?3",
+        params![author_note, now, session_id],
+    )
+    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    match read_group_session(&conn, &session_id)? {
+        Some(session) => serde_json::to_string(&session)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e)),
+        None => Err(crate::utils::err_msg(
+            module_path!(),
+            line!(),
+            "Session not found",
+        )),
+    }
+}
+
+#[tauri::command]
+pub fn group_session_update_memory_type(
+    session_id: String,
+    memory_type: String,
+    pool: State<'_, SwappablePool>,
+) -> Result<String, String> {
+    let conn = pool.get_connection()?;
+    let now = now_ms() as i64;
+
+    if memory_type != "manual" && memory_type != "dynamic" {
+        return Err(crate::utils::err_msg(
+            module_path!(),
+            line!(),
+            "Invalid memory_type. Must be 'manual' or 'dynamic'",
+        ));
+    }
+
+    conn.execute(
+        "UPDATE group_sessions SET memory_type = ?1, updated_at = ?2 WHERE id = ?3",
+        params![memory_type, now, session_id],
+    )
+    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    write_group_config_overrides(
+        &conn,
+        &session_id,
+        &[("memoryType", serde_json::json!(memory_type))],
+    )?;
+
+    match read_group_session(&conn, &session_id)? {
+        Some(session) => serde_json::to_string(&session)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e)),
+        None => Err(crate::utils::err_msg(
+            module_path!(),
+            line!(),
+            "Session not found",
+        )),
+    }
+}
+
+#[tauri::command]
+pub fn group_session_update_speaker_selection_method(
+    session_id: String,
+    speaker_selection_method: String,
+    pool: State<'_, SwappablePool>,
+) -> Result<String, String> {
+    let conn = pool.get_connection()?;
+    let now = now_ms() as i64;
+
+    if speaker_selection_method != "llm"
+        && speaker_selection_method != "heuristic"
+        && speaker_selection_method != "round_robin"
+        && speaker_selection_method != "director"
+        && speaker_selection_method != "director_action"
+    {
+        return Err(crate::utils::err_msg(
+            module_path!(),
+            line!(),
+            "Invalid speaker_selection_method. Must be 'llm', 'heuristic', 'round_robin', 'director', or 'director_action'",
+        ));
+    }
+
+    conn.execute(
+        "UPDATE group_sessions SET speaker_selection_method = ?1, updated_at = ?2 WHERE id = ?3",
+        params![speaker_selection_method, now, session_id],
+    )
+    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    write_group_config_overrides(
+        &conn,
+        &session_id,
+        &[(
+            "speakerSelectionMethod",
+            serde_json::json!(speaker_selection_method),
+        )],
+    )?;
+
+    match read_group_session(&conn, &session_id)? {
+        Some(session) => serde_json::to_string(&session)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e)),
+        None => Err(crate::utils::err_msg(
+            module_path!(),
+            line!(),
+            "Session not found",
+        )),
+    }
+}
+
+#[tauri::command]
+pub fn group_session_update_muted_character_ids(
+    session_id: String,
+    muted_character_ids_json: String,
+    pool: State<'_, SwappablePool>,
+) -> Result<String, String> {
+    let conn = pool.get_connection()?;
+    let now = now_ms() as i64;
+
+    let session =
+        read_group_session(&conn, &session_id)?.ok_or_else(|| "Session not found".to_string())?;
+    let mut muted_character_ids: Vec<String> = serde_json::from_str(&muted_character_ids_json)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    muted_character_ids.retain(|id| session.character_ids.contains(id));
+    muted_character_ids.sort();
+    muted_character_ids.dedup();
+    if muted_character_ids.len() >= session.character_ids.len() {
+        return Err(crate::utils::err_msg(
+            module_path!(),
+            line!(),
+            "At least one participant must remain active",
+        ));
+    }
+    let next_muted_json = serde_json::to_string(&muted_character_ids)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    conn.execute(
+        "UPDATE group_sessions SET muted_character_ids = ?1, updated_at = ?2 WHERE id = ?3",
+        params![next_muted_json, now, session_id],
+    )
+    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    write_group_config_overrides(
+        &conn,
+        &session_id,
+        &[("mutedCharacterIds", serde_json::json!(muted_character_ids))],
+    )?;
+
+    match read_group_session(&conn, &session_id)? {
+        Some(session) => serde_json::to_string(&session)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e)),
+        None => Err(crate::utils::err_msg(
+            module_path!(),
+            line!(),
+            "Session not found",
+        )),
+    }
+}
+
+const GROUP_SESSION_OVERRIDE_KEYS: [&str; 13] = [
+    "characterIds",
+    "mutedCharacterIds",
+    "personaId",
+    "chatType",
+    "startingScene",
+    "backgroundImagePath",
+    "lorebookIds",
+    "disableCharacterLorebooks",
+    "speakerSelectionMethod",
+    "memoryType",
+    "characterModelOverrides",
+    "groupChatPromptTemplateId",
+    "groupChatRoleplayPromptTemplateId",
+];
+
+#[tauri::command]
+pub fn group_session_update_persona(
+    session_id: String,
+    persona_id: Option<String>,
+    pool: State<'_, SwappablePool>,
+) -> Result<String, String> {
+    let conn = pool.get_connection()?;
+    let now = now_ms() as i64;
+
+    conn.execute(
+        "UPDATE group_sessions SET persona_id = ?1, updated_at = ?2 WHERE id = ?3",
+        params![persona_id, now, session_id],
+    )
+    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    write_group_config_overrides(
+        &conn,
+        &session_id,
+        &[("personaId", serde_json::json!(persona_id))],
+    )?;
+
+    match read_group_session(&conn, &session_id)? {
+        Some(session) => serde_json::to_string(&session)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e)),
+        None => Err(crate::utils::err_msg(
+            module_path!(),
+            line!(),
+            "Session not found",
+        )),
+    }
+}
+
+#[tauri::command]
+pub fn group_session_update_character_model_override(
+    session_id: String,
+    character_id: String,
+    model_id: Option<String>,
+    pool: State<'_, SwappablePool>,
+) -> Result<String, String> {
+    let conn = pool.get_connection()?;
+    let now = now_ms() as i64;
+
+    let session =
+        read_group_session(&conn, &session_id)?.ok_or_else(|| "Session not found".to_string())?;
+    if !session.character_ids.contains(&character_id) {
+        return Err(crate::utils::err_msg(
+            module_path!(),
+            line!(),
+            "Character is not a participant of this session",
+        ));
+    }
+
+    let mut overrides = session.character_model_overrides.clone();
+    match model_id.filter(|id| !id.trim().is_empty()) {
+        Some(id) => {
+            overrides.insert(character_id, id);
+        }
+        None => {
+            overrides.remove(&character_id);
+        }
+    }
+    let overrides_json = serde_json::to_string(&overrides)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    conn.execute(
+        "UPDATE group_sessions SET character_model_overrides = ?1, updated_at = ?2 WHERE id = ?3",
+        params![overrides_json, now, session_id],
+    )
+    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    write_group_config_overrides(
+        &conn,
+        &session_id,
+        &[("characterModelOverrides", serde_json::json!(overrides))],
+    )?;
+
+    match read_group_session(&conn, &session_id)? {
+        Some(session) => serde_json::to_string(&session)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e)),
+        None => Err(crate::utils::err_msg(
+            module_path!(),
+            line!(),
+            "Session not found",
+        )),
+    }
+}
+
+#[tauri::command]
+pub fn group_session_update_prompt_template(
+    session_id: String,
+    chat_type: String,
+    prompt_template_id: Option<String>,
+    pool: State<'_, SwappablePool>,
+) -> Result<String, String> {
+    let conn = pool.get_connection()?;
+    let now = now_ms() as i64;
+
+    let (column, override_key) = match chat_type.as_str() {
+        "roleplay" => (
+            "group_chat_roleplay_prompt_template_id",
+            "groupChatRoleplayPromptTemplateId",
+        ),
+        "conversation" => ("group_chat_prompt_template_id", "groupChatPromptTemplateId"),
+        _ => {
+            return Err(crate::utils::err_msg(
+                module_path!(),
+                line!(),
+                "Invalid chat_type. Must be 'conversation' or 'roleplay'",
+            ))
+        }
+    };
+    let prompt_template_id = prompt_template_id.filter(|id| !id.trim().is_empty());
+
+    conn.execute(
+        &format!("UPDATE group_sessions SET {column} = ?1, updated_at = ?2 WHERE id = ?3"),
+        params![prompt_template_id, now, session_id],
+    )
+    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    write_group_config_overrides(
+        &conn,
+        &session_id,
+        &[(override_key, serde_json::json!(prompt_template_id))],
+    )?;
+
+    match read_group_session(&conn, &session_id)? {
+        Some(session) => serde_json::to_string(&session)
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e)),
+        None => Err(crate::utils::err_msg(
+            module_path!(),
+            line!(),
+            "Session not found",
+        )),
+    }
+}
+
+#[tauri::command]
+pub fn group_session_clear_config_override(
+    app: AppHandle,
+    session_id: String,
+    key: String,
+    pool: State<'_, SwappablePool>,
+) -> Result<String, String> {
+    if !GROUP_SESSION_OVERRIDE_KEYS.contains(&key.as_str()) {
+        return Err(crate::utils::err_msg(
+            module_path!(),
+            line!(),
+            "Unknown override key",
+        ));
+    }
+
+    {
+        let mut conn = pool.get_connection()?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+        let now = now_ms() as i64;
+
+        let raw: Option<String> = tx
+            .query_row(
+                "SELECT config_overrides FROM group_sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+        if raw.is_none() {
+            return Err(crate::utils::err_msg(
+                module_path!(),
+                line!(),
+                "Session not found",
+            ));
+        }
+        let mut object = raw
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        object.remove(&key);
+        object.insert("version".to_string(), serde_json::json!(1));
+        tx.execute(
+            "UPDATE group_sessions SET config_overrides = ?1, updated_at = ?2 WHERE id = ?3",
+            params![
+                serde_json::Value::Object(object).to_string(),
+                now,
+                session_id
+            ],
+        )
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+        let resolved = read_group_session(&tx, &session_id)?
+            .ok_or_else(|| crate::utils::err_msg(module_path!(), line!(), "Session not found"))?;
+
+        match key.as_str() {
+            "characterIds" => {
+                tx.execute(
+                    "UPDATE group_sessions SET character_ids = ?1, muted_character_ids = ?2 WHERE id = ?3",
+                    params![
+                        serde_json::to_string(&resolved.character_ids)
+                            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+                        serde_json::to_string(&resolved.muted_character_ids)
+                            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+                        session_id
+                    ],
+                )
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+                ensure_participation_records(&tx, &session_id, &resolved.character_ids)?;
+            }
+            "mutedCharacterIds" => {
+                tx.execute(
+                    "UPDATE group_sessions SET muted_character_ids = ?1 WHERE id = ?2",
+                    params![
+                        serde_json::to_string(&resolved.muted_character_ids)
+                            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+                        session_id
+                    ],
+                )
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+            }
+            "personaId" => {
+                tx.execute(
+                    "UPDATE group_sessions SET persona_id = ?1 WHERE id = ?2",
+                    params![resolved.persona_id, session_id],
+                )
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+            }
+            "chatType" => {
+                tx.execute(
+                    "UPDATE group_sessions SET chat_type = ?1 WHERE id = ?2",
+                    params![resolved.chat_type, session_id],
+                )
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+            }
+            "startingScene" => {
+                tx.execute(
+                    "UPDATE group_sessions SET starting_scene = ?1 WHERE id = ?2",
+                    params![
+                        resolved
+                            .starting_scene
+                            .as_ref()
+                            .and_then(|value| serde_json::to_string(value).ok()),
+                        session_id
+                    ],
+                )
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+            }
+            "backgroundImagePath" => {
+                tx.execute(
+                    "UPDATE group_sessions SET background_image_path = ?1 WHERE id = ?2",
+                    params![resolved.background_image_path, session_id],
+                )
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+            }
+            "lorebookIds" => {
+                tx.execute(
+                    "UPDATE group_sessions SET lorebook_ids = ?1 WHERE id = ?2",
+                    params![
+                        serde_json::to_string(&resolved.lorebook_ids)
+                            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+                        session_id
+                    ],
+                )
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+            }
+            "disableCharacterLorebooks" => {
+                tx.execute(
+                    "UPDATE group_sessions SET disable_character_lorebooks = ?1 WHERE id = ?2",
+                    params![resolved.disable_character_lorebooks as i64, session_id],
+                )
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+            }
+            "speakerSelectionMethod" => {
+                tx.execute(
+                    "UPDATE group_sessions SET speaker_selection_method = ?1 WHERE id = ?2",
+                    params![resolved.speaker_selection_method, session_id],
+                )
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+            }
+            "memoryType" => {
+                tx.execute(
+                    "UPDATE group_sessions SET memory_type = ?1 WHERE id = ?2",
+                    params![resolved.memory_type, session_id],
+                )
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+            }
+            "characterModelOverrides" => {
+                tx.execute(
+                    "UPDATE group_sessions SET character_model_overrides = ?1 WHERE id = ?2",
+                    params![
+                        serde_json::to_string(&resolved.character_model_overrides)
+                            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+                        session_id
+                    ],
+                )
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+            }
+            "groupChatPromptTemplateId" => {
+                tx.execute(
+                    "UPDATE group_sessions SET group_chat_prompt_template_id = ?1 WHERE id = ?2",
+                    params![resolved.group_chat_prompt_template_id, session_id],
+                )
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+            }
+            "groupChatRoleplayPromptTemplateId" => {
+                tx.execute(
+                    "UPDATE group_sessions SET group_chat_roleplay_prompt_template_id = ?1 WHERE id = ?2",
+                    params![resolved.group_chat_roleplay_prompt_template_id, session_id],
+                )
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+            }
+            _ => {}
+        }
+
+        tx.commit()
+            .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    }
+
+    group_session_get(app, session_id, pool)
+}
+
+#[tauri::command]
+pub fn group_participation_stats(
+    session_id: String,
+    pool: State<'_, SwappablePool>,
+) -> Result<String, String> {
+    let conn = pool.get_connection()?;
+    let stats = read_group_participation(&conn, &session_id)?;
+    serde_json::to_string(&stats)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))
+}
+
+#[tauri::command]
+pub fn group_participation_increment(
+    session_id: String,
+    character_id: String,
+    turn_number: i32,
+    pool: State<'_, SwappablePool>,
+) -> Result<(), String> {
+    let conn = pool.get_connection()?;
+    let now = now_ms();
+
+    conn.execute(
+        "UPDATE group_participation
+         SET speak_count = speak_count + 1, last_spoke_turn = ?1, last_spoke_at = ?2
+         WHERE session_id = ?3 AND character_id = ?4",
+        params![turn_number, now, session_id, character_id],
+    )
+    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    Ok(())
+}
+
+#[tauri::command]
+pub fn group_messages_list(
+    session_id: String,
+    limit: i32,
+    before_created_at: Option<i64>,
+    before_id: Option<String>,
+    pool: State<'_, SwappablePool>,
+) -> Result<String, String> {
+    let conn = pool.get_connection()?;
+    let messages = read_group_messages(
+        &conn,
+        &session_id,
+        limit,
+        before_created_at,
+        before_id.as_deref(),
+    )?;
+    serde_json::to_string(&messages)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))
+}
+
+#[tauri::command]
+pub fn group_search_messages(
+    session_id: String,
+    query: String,
+    pool: State<'_, SwappablePool>,
+) -> Result<String, String> {
+    let trimmed = query.trim().to_lowercase();
+    if trimmed.is_empty() {
+        return Ok("[]".to_string());
+    }
+    let conn = pool.get_connection()?;
+    let results: Vec<serde_json::Value> =
+        read_group_messages(&conn, &session_id, i32::MAX, None, None)?
+            .into_iter()
+            .filter(|message| {
+                (message.role == "user" || message.role == "assistant" || message.role == "scene")
+                    && message.content.to_lowercase().contains(&trimmed)
+            })
+            .map(|message| {
+                serde_json::json!({
+                    "messageId": message.id,
+                    "content": message.content,
+                    "createdAt": message.created_at,
+                    "role": message.role,
+                    "speakerCharacterId": message.speaker_character_id,
+                })
+            })
+            .collect();
+    serde_json::to_string(&results)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))
+}
+
+#[tauri::command]
+pub fn group_messages_list_pinned(
+    session_id: String,
+    pool: State<'_, SwappablePool>,
+) -> Result<String, String> {
+    let conn = pool.get_connection()?;
+    let messages = read_group_messages(&conn, &session_id, i32::MAX, None, None)?
+        .into_iter()
+        .filter(|message| message.is_pinned)
+        .collect::<Vec<_>>();
+    serde_json::to_string(&messages)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))
+}
+
+#[tauri::command]
+pub fn group_message_upsert(
+    session_id: String,
+    message_json: String,
+    pool: State<'_, SwappablePool>,
+) -> Result<String, String> {
+    let conn = pool.get_connection()?;
+    let now = now_ms();
+
+    let mut message: GroupMessage = serde_json::from_str(&message_json)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    // Check if message exists
+    let exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM group_messages WHERE id = ?1",
+            params![message.id],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+
+    let attachments_json = serde_json::to_string(&message.attachments)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    if exists {
+        // Update
+        conn.execute(
+            "UPDATE group_messages SET content = ?1, speaker_character_id = ?2, selected_variant_id = ?3,
+             is_pinned = ?4, attachments = ?5, reasoning = ?6, selection_reasoning = ?7,
+             model_id = ?8, gemini_content = ?9, used_lorebook_entries = ?10, memory_refs = ?11,
+             usage_json = ?12 WHERE id = ?13",
+            params![
+                message.content,
+                message.speaker_character_id,
+                message.selected_variant_id,
+                message.is_pinned as i32,
+                attachments_json,
+                message.reasoning,
+                message.selection_reasoning,
+                message.model_id,
+                message.gemini_content.as_ref().and_then(|value| serde_json::to_string(value).ok()),
+                serde_json::to_string(&message.used_lorebook_entries).unwrap_or_else(|_| "[]".to_string()),
+                serde_json::to_string(&message.memory_refs).unwrap_or_else(|_| "[]".to_string()),
+                message.usage.as_ref().and_then(|value| serde_json::to_string(value).ok()),
+                message.id
+            ],
+        )
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    } else {
+        // Insert
+        let turn_number = get_next_turn_number(&conn, &session_id)?;
+        message.turn_number = turn_number;
+        message.created_at = now as i64;
+
+        let (
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            first_token_ms,
+            tokens_per_second,
+            mtp_stats,
+        ) = match &message.usage {
+            Some(u) => (
+                u.prompt_tokens,
+                u.completion_tokens,
+                u.total_tokens,
+                u.first_token_ms,
+                u.tokens_per_second,
+                u.mtp_stats
+                    .as_ref()
+                    .and_then(|value| serde_json::to_string(value).ok()),
+            ),
+            None => (None, None, None, None, None, None),
+        };
+
+        conn.execute(
+            "INSERT INTO group_messages (id, session_id, role, content, speaker_character_id, turn_number,
+             created_at, prompt_tokens, completion_tokens, total_tokens, selected_variant_id, is_pinned,
+             attachments, reasoning, selection_reasoning, first_token_ms, tokens_per_second, mtp_stats, model_id, gemini_content, used_lorebook_entries, memory_refs, usage_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+            params![
+                message.id,
+                session_id,
+                message.role,
+                message.content,
+                message.speaker_character_id,
+                turn_number,
+                now,
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+                message.selected_variant_id,
+                message.is_pinned as i32,
+                attachments_json,
+                message.reasoning,
+                message.selection_reasoning,
+                first_token_ms,
+                tokens_per_second,
+                mtp_stats,
+                message.model_id,
+                message.gemini_content.as_ref().and_then(|value| serde_json::to_string(value).ok()),
+                serde_json::to_string(&message.used_lorebook_entries).unwrap_or_else(|_| "[]".to_string()),
+                serde_json::to_string(&message.memory_refs).unwrap_or_else(|_| "[]".to_string()),
+                message.usage.as_ref().and_then(|value| serde_json::to_string(value).ok())
+            ],
+        )
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+        // Update session timestamp
+        conn.execute(
+            "UPDATE group_sessions SET updated_at = ?1 WHERE id = ?2",
+            params![now, session_id],
+        )
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    }
+
+    serde_json::to_string(&message)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))
+}
+
+#[tauri::command]
+pub fn group_message_toggle_pin_state(
+    session_id: String,
+    message_id: String,
+    pool: State<'_, SwappablePool>,
+) -> Result<Option<bool>, String> {
+    let conn = pool.get_connection()?;
+    let now = now_ms() as i64;
+    let current: Option<i64> = conn
+        .query_row(
+            "SELECT is_pinned FROM group_messages WHERE id = ?1 AND session_id = ?2",
+            params![&message_id, &session_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    if let Some(is_pinned) = current {
+        let next = if is_pinned == 0 { 1 } else { 0 };
+        conn.execute(
+            "UPDATE group_messages SET is_pinned = ?1 WHERE id = ?2 AND session_id = ?3",
+            params![next, &message_id, &session_id],
+        )
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+        conn.execute(
+            "UPDATE group_sessions SET updated_at = ?1 WHERE id = ?2",
+            params![now, &session_id],
+        )
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+        Ok(Some(next != 0))
+    } else {
+        Ok(None)
+    }
+}
+
+#[tauri::command]
+pub fn group_message_delete(
+    app: tauri::AppHandle,
+    session_id: String,
+    message_id: String,
+    pool: State<'_, SwappablePool>,
+) -> Result<(), String> {
+    let conn = pool.get_connection()?;
+
+    let deleted = conn
+        .execute(
+            "DELETE FROM group_messages WHERE id = ?1 AND session_id = ?2",
+            params![message_id, session_id],
+        )
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    log_info(
+        &app,
+        "group_message_delete",
+        format!(
+            "Deleting group message {} from session {} (deleted={})",
+            message_id, session_id, deleted
+        ),
+    );
+
+    Ok(())
+}
+
+#[tauri::command]
+pub fn group_messages_delete_after(
+    app: tauri::AppHandle,
+    session_id: String,
+    message_id: String,
+    pool: State<'_, SwappablePool>,
+) -> Result<(), String> {
+    let mut conn = pool.get_connection()?;
+
+    // Get the turn number of the reference message
+    let turn_number: i32 = conn
+        .query_row(
+            "SELECT turn_number FROM group_messages WHERE id = ?1 AND session_id = ?2",
+            params![message_id, session_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    // Delete all messages with higher turn number
+    let deleted = conn
+        .execute(
+            "DELETE FROM group_messages WHERE session_id = ?1 AND turn_number > ?2",
+            params![session_id, turn_number],
+        )
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    log_info(
+        &app,
+        "group_messages_delete_after",
+        format!(
+            "Rewinding group session {} after message {} (rows_affected={})",
+            session_id, message_id, deleted
+        ),
+    );
+
+    rewind_group_session_memory_state(&mut conn, &session_id)?;
+
+    Ok(())
+}
+
+#[tauri::command]
+pub fn group_message_add_variant(
+    message_id: String,
+    variant_json: String,
+    pool: State<'_, SwappablePool>,
+) -> Result<String, String> {
+    let conn = pool.get_connection()?;
+    let now = now_ms();
+
+    let mut variant: GroupMessageVariant = serde_json::from_str(&variant_json)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    if variant.id.is_empty() {
+        variant.id = Uuid::new_v4().to_string();
+    }
+    variant.created_at = now as i64;
+
+    let (
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+        first_token_ms,
+        tokens_per_second,
+        mtp_stats,
+    ) = match &variant.usage {
+        Some(u) => (
+            u.prompt_tokens,
+            u.completion_tokens,
+            u.total_tokens,
+            u.first_token_ms,
+            u.tokens_per_second,
+            u.mtp_stats
+                .as_ref()
+                .and_then(|value| serde_json::to_string(value).ok()),
+        ),
+        None => (None, None, None, None, None, None),
+    };
+
+    conn.execute(
+        "INSERT INTO group_message_variants (id, message_id, content, speaker_character_id, created_at,
+         prompt_tokens, completion_tokens, total_tokens, reasoning, selection_reasoning, first_token_ms, tokens_per_second, mtp_stats, model_id, attachments, gemini_content, usage_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+        params![
+            variant.id,
+            message_id,
+            variant.content,
+            variant.speaker_character_id,
+            now,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            variant.reasoning,
+            variant.selection_reasoning,
+            first_token_ms,
+            tokens_per_second,
+            mtp_stats,
+            variant.model_id,
+            serde_json::to_string(&variant.attachments).unwrap_or_else(|_| "[]".to_string()),
+            variant.gemini_content.as_ref().and_then(|value| serde_json::to_string(value).ok()),
+            variant.usage.as_ref().and_then(|value| serde_json::to_string(value).ok())
+        ],
+    )
+    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    // Update the selected variant id on the message
+    conn.execute(
+        "UPDATE group_messages SET selected_variant_id = ?1 WHERE id = ?2",
+        params![variant.id, message_id],
+    )
+    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    serde_json::to_string(&variant)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))
+}
+
+#[tauri::command]
+pub fn group_message_select_variant(
+    message_id: String,
+    variant_id: String,
+    pool: State<'_, SwappablePool>,
+) -> Result<(), String> {
+    let conn = pool.get_connection()?;
+
+    // Get variant content and speaker
+    let (content, speaker_id, reasoning, selection_reasoning): (String, Option<String>, Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT content, speaker_character_id, reasoning, selection_reasoning FROM group_message_variants WHERE id = ?1",
+            params![variant_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    // Update message with variant content and selection
+    conn.execute(
+        "UPDATE group_messages SET content = ?1, speaker_character_id = ?2, selected_variant_id = ?3, reasoning = ?4, selection_reasoning = ?5 WHERE id = ?6",
+        params![content, speaker_id, variant_id, reasoning, selection_reasoning, message_id],
+    )
+    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    Ok(())
+}
+
+#[tauri::command]
+pub fn group_message_count(
+    session_id: String,
+    pool: State<'_, SwappablePool>,
+) -> Result<i32, String> {
+    let conn = pool.get_connection()?;
+
+    let count: i32 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM group_messages WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    Ok(count)
+}
+
+// ============================================================================
+// Memory Operations
+// ============================================================================
+
+/// Update memory embeddings for a group session
+#[tauri::command]
+pub fn group_session_update_memories(
+    session_id: String,
+    memory_embeddings_json: String,
+    memory_summary: Option<String>,
+    memory_summary_token_count: Option<i32>,
+    memory_status: Option<String>,
+    memory_error: Option<String>,
+    pool: State<'_, SwappablePool>,
+) -> Result<(), String> {
+    let mut conn = pool.get_connection()?;
+    let now = now_ms();
+
+    let parsed: Vec<MemoryEmbedding> = serde_json::from_str(&memory_embeddings_json)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    write_group_embeddings_through_table(&mut *conn, &session_id, &parsed)?;
+
+    conn.execute(
+        "UPDATE group_sessions SET memory_summary = ?1, memory_summary_token_count = ?2, memory_status = ?3, memory_error = ?4, updated_at = ?5 WHERE id = ?6",
+        params![
+            memory_summary.unwrap_or_default(),
+            memory_summary_token_count.unwrap_or(0),
+            memory_status.unwrap_or_else(|| "idle".to_string()),
+            memory_error,
+            now,
+            session_id
+        ],
+    )
+    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    Ok(())
+}
+
+/// Replace the full memory state for a group session.
+#[tauri::command]
+pub fn group_session_update_memory_state(
+    session_id: String,
+    memories_json: String,
+    memory_embeddings_json: String,
+    memory_summary: Option<String>,
+    memory_summary_token_count: Option<i32>,
+    memory_tool_events_json: String,
+    memory_status: Option<String>,
+    memory_error: Option<String>,
+    pool: State<'_, SwappablePool>,
+) -> Result<(), String> {
+    let mut conn = pool.get_connection()?;
+    let now = now_ms();
+
+    let parsed: Vec<MemoryEmbedding> = serde_json::from_str(&memory_embeddings_json)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    write_group_embeddings_through_table(&mut *conn, &session_id, &parsed)?;
+
+    conn.execute(
+        "UPDATE group_sessions SET memories = ?1, memory_summary = ?2, memory_summary_token_count = ?3, memory_tool_events = ?4, memory_status = ?5, memory_error = ?6, updated_at = ?7 WHERE id = ?8",
+        params![
+            memories_json,
+            memory_summary.unwrap_or_default(),
+            memory_summary_token_count.unwrap_or(0),
+            memory_tool_events_json,
+            memory_status.unwrap_or_else(|| "idle".to_string()),
+            memory_error,
+            now,
+            session_id
+        ],
+    )
+    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    Ok(())
+}
+
+/// Update manual memories for a group session
+#[tauri::command]
+pub fn group_session_update_manual_memories(
+    session_id: String,
+    memories_json: String,
+    pool: State<'_, SwappablePool>,
+) -> Result<(), String> {
+    let conn = pool.get_connection()?;
+    let now = now_ms();
+
+    conn.execute(
+        "UPDATE group_sessions SET memories = ?1, updated_at = ?2 WHERE id = ?3",
+        params![memories_json, now, session_id],
+    )
+    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    Ok(())
+}
+
+/// Internal function to update memory embeddings (used by group_chat_manager)
+pub fn group_session_update_memories_internal(
+    conn: &Connection,
+    session_id: &str,
+    memories: &[String],
+    memory_embeddings: &[MemoryEmbedding],
+    memory_summary: Option<&str>,
+    memory_summary_token_count: i32,
+    memory_tool_events: &[serde_json::Value],
+    memory_status: Option<&str>,
+    memory_error: Option<&str>,
+    memory_progress_step: Option<i32>,
+) -> Result<(), String> {
+    let now = now_ms();
+    let memories_json = serde_json::to_string(memories)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    let memory_embeddings_json = serde_json::to_string(memory_embeddings)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    let memory_tool_events_json = serde_json::to_string(memory_tool_events)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    conn.execute(
+        "UPDATE group_sessions SET memories = ?1, memory_embeddings = ?2, memory_summary = ?3, memory_summary_token_count = ?4, memory_tool_events = ?5, memory_status = ?6, memory_error = ?7, memory_progress_step = ?8, updated_at = ?9 WHERE id = ?10",
+        params![
+            memories_json,
+            memory_embeddings_json,
+            memory_summary.unwrap_or(""),
+            memory_summary_token_count,
+            memory_tool_events_json,
+            memory_status.unwrap_or("idle"),
+            memory_error,
+            memory_progress_step,
+            now,
+            session_id
+        ],
+    )
+    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+
+    Ok(())
+}
+
+// ============================================================================
+// Group Session Memory CRUD Operations
+// ============================================================================
+
+/// Add a manual memory to a group session
+fn group_conversation_anchor(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<(usize, Option<String>), String> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(1) FROM group_messages WHERE session_id = ?1 AND role IN ('user','assistant')",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    let anchor: Option<String> = conn
+        .query_row(
+            "SELECT id FROM group_messages WHERE session_id = ?1 AND role IN ('user','assistant') ORDER BY turn_number DESC, created_at DESC, id DESC LIMIT 1",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    Ok((count.max(0) as usize, anchor))
+}
+
+fn append_group_user_memory_event(
+    conn: &Connection,
+    session_id: &str,
+    action: serde_json::Value,
+) -> Result<(), String> {
+    let (count, anchor) = group_conversation_anchor(conn, session_id)?;
+    let event =
+        crate::conversation_manager::memory::build_user_memory_edit_event(action, count, anchor);
+    let raw: Option<Option<String>> = conn
+        .query_row(
+            "SELECT memory_tool_events FROM group_sessions WHERE id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    let mut events: Vec<serde_json::Value> = raw
+        .flatten()
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or_default();
+    events.push(event);
+    if events.len() > crate::conversation_manager::memory::MEMORY_TOOL_EVENT_CAP {
+        let excess = events.len() - crate::conversation_manager::memory::MEMORY_TOOL_EVENT_CAP;
+        events.drain(0..excess);
+    }
+    conn.execute(
+        "UPDATE group_sessions SET memory_tool_events = ?1 WHERE id = ?2",
+        params![
+            serde_json::to_string(&events).map_err(|e| crate::utils::err_to_string(
+                module_path!(),
+                line!(),
+                e
+            ))?,
+            session_id
+        ],
+    )
+    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    Ok(())
+}
+
+fn rewind_group_session_memory_state(
+    conn: &mut Connection,
+    session_id: &str,
+) -> Result<(), String> {
+    let row: Option<(Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT memory_tool_events, memory_summary FROM group_sessions WHERE id = ?1",
+            params![session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    let Some((raw_events, prior_summary)) = row else {
+        return Ok(());
+    };
+    let events: Vec<serde_json::Value> = raw_events
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or_default();
+    if events.is_empty() {
+        return Ok(());
+    }
+    let prior_summary = prior_summary.unwrap_or_default();
+    let embeddings = read_group_embeddings_with_fallback(conn, session_id)?;
+    let (remaining_count, _) = group_conversation_anchor(conn, session_id)?;
+
+    let replayed = {
+        let conn_ref: &Connection = conn;
+        crate::conversation_manager::memory::replay_memory_state_after_rewind(
+            &events,
+            &embeddings,
+            &prior_summary,
+            remaining_count,
+            |message_id| {
+                let found: i64 = conn_ref
+                    .query_row(
+                        "SELECT COUNT(1) FROM group_messages WHERE id = ?1 AND session_id = ?2",
+                        params![message_id, session_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+                Ok(found > 0)
+            },
+        )?
+    };
+
+    let Some(state) = replayed else {
+        return Ok(());
+    };
+
+    write_group_embeddings_through_table(conn, session_id, &state.embeddings)?;
+    let memories: Vec<String> = state
+        .embeddings
+        .iter()
+        .map(|memory| memory.text.clone())
+        .collect();
+    conn.execute(
+        "UPDATE group_sessions SET memories = ?1, memory_tool_events = ?2, memory_summary = ?3,
+                memory_summary_token_count = CASE WHEN ?4 THEN memory_summary_token_count ELSE 0 END,
+                memory_status = 'idle', memory_error = NULL, updated_at = ?5
+         WHERE id = ?6",
+        params![
+            serde_json::to_string(&memories)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            serde_json::to_string(&state.events)
+                .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+            state.summary,
+            state.summary_unchanged,
+            now_ms() as i64,
+            session_id
+        ],
+    )
+    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn group_session_add_memory(
+    app: tauri::AppHandle,
+    session_id: String,
+    memory: String,
+    pool: State<'_, SwappablePool>,
+) -> Result<Option<String>, String> {
+    use crate::utils::log_info;
+
+    log_info(
+        &app,
+        "group_session_add_memory",
+        format!("Adding memory to group session {}", session_id),
+    );
+
+    let mut conn = pool.get_connection()?;
+
+    // Read current memories (legacy column) and embeddings (new table when
+    // populated; legacy JSON column otherwise as a one-time backfill source).
+    let current_memories_json: String = conn
+        .query_row(
+            "SELECT memories FROM group_sessions WHERE id = ?",
+            params![&session_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?
+        .unwrap_or_else(|| "[]".to_string());
+
+    let mut memories: Vec<String> =
+        serde_json::from_str(&current_memories_json).unwrap_or_else(|_| vec![]);
+    let mut memory_embeddings = read_group_embeddings_with_fallback(&conn, &session_id)?;
+
+    // Add new memory
+    memories.push(memory.clone());
+
+    // Compute embedding (best-effort)
+    let embedding: Vec<f32> = match crate::embedding::compute_embedding(app.clone(), memory.clone())
+        .await
+    {
+        Ok(vec) => vec,
+        Err(err) => {
+            crate::utils::log_warn(
+                    &app,
+                    "group_session_add_memory",
+                    format!(
+                        "embedding computation failed; storing memory without an embedding (it will not be semantically retrievable): {}",
+                        err
+                    ),
+                );
+            Vec::new()
+        }
+    };
+
+    // Count tokens (best-effort)
+    let token_count = match crate::embedding::tokenizer::count_tokens(&app, &memory) {
+        Ok(count) => count,
+        Err(err) => {
+            crate::utils::log_warn(
+                &app,
+                "group_session_add_memory",
+                format!("token count failed; defaulting to 0: {}", err),
+            );
+            0
+        }
+    };
+    let (embedding_source_version, embedding_dimensions) =
+        match crate::embedding::resolve_active_embedding_signature(&app) {
+            Ok(sig) => sig,
+            Err(err) => {
+                crate::utils::log_warn(
+                    &app,
+                    "group_session_add_memory",
+                    format!(
+                        "could not resolve active embedding signature; falling back to v3/512 (may mismatch stored vectors): {}",
+                        err
+                    ),
+                );
+                ("v3".to_string(), 512)
+            }
+        };
+
+    let now = now_ms();
+    let new_memory_id = uuid::Uuid::new_v4().to_string();
+    let event_text = memory.clone();
+    memory_embeddings.push(MemoryEmbedding {
+        id: new_memory_id.clone(),
+        text: memory,
+        embedding,
+        created_at: now,
+        token_count: token_count as u32,
+        is_cold: false,
+        last_accessed_at: now,
+        importance_score: 1.0,
+        persistence_importance: 1.0,
+        prompt_importance: 1.0,
+        volatility: 0.4,
+        is_pinned: false,
+        access_count: 0,
+        embedding_source_version: Some(embedding_source_version),
+        embedding_dimensions: Some(embedding_dimensions),
+        match_score: None,
+        category: None,
+        observed_at: None,
+        observed_time_precision: None,
+        canonical_entities: Vec::new(),
+        fact_signature: None,
+        fact_polarity: None,
+        source_role: None,
+        source_message_id: None,
+        superseded_by: None,
+        superseded_at: None,
+        supersedes: Vec::new(),
+    });
+
+    // Save back: embeddings via new table, memories + updated_at via legacy.
+    write_group_embeddings_through_table(&mut *conn, &session_id, &memory_embeddings)?;
+    let new_memories_json = serde_json::to_string(&memories)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    let now = now_ms();
+    conn.execute(
+        "UPDATE group_sessions SET memories = ?, updated_at = ? WHERE id = ?",
+        params![new_memories_json, now, &session_id],
+    )
+    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    append_group_user_memory_event(
+        &conn,
+        &session_id,
+        serde_json::json!({
+            "name": "create_memory",
+            "memoryId": new_memory_id,
+            "timestamp": now,
+            "arguments": { "text": event_text, "important": false },
+        }),
+    )?;
+
+    // Return updated session
+    if let Some(session) = read_group_session(&conn, &session_id)? {
+        return Ok(Some(serde_json::to_string(&session).map_err(|e| {
+            crate::utils::err_to_string(module_path!(), line!(), e)
+        })?));
+    }
+    Ok(None)
+}
+
+/// Remove a memory from a group session by index
+#[tauri::command]
+pub fn group_session_remove_memory(
+    session_id: String,
+    memory_index: usize,
+    pool: State<'_, SwappablePool>,
+) -> Result<Option<String>, String> {
+    let mut conn = pool.get_connection()?;
+
+    // Read current memories (legacy column) and embeddings (new table or
+    // legacy fallback).
+    let current_memories_json: String = conn
+        .query_row(
+            "SELECT memories FROM group_sessions WHERE id = ?",
+            params![&session_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?
+        .unwrap_or_else(|| "[]".to_string());
+
+    let mut memories: Vec<String> =
+        serde_json::from_str(&current_memories_json).unwrap_or_else(|_| vec![]);
+    let mut memory_embeddings = read_group_embeddings_with_fallback(&conn, &session_id)?;
+
+    // Remove at index if valid
+    let removed_text = if memory_index < memories.len() {
+        Some(memories.remove(memory_index))
+    } else {
+        None
+    };
+    let removed_embedding = if memory_index < memory_embeddings.len() {
+        Some(memory_embeddings.remove(memory_index))
+    } else {
+        None
+    };
+
+    // Save back
+    write_group_embeddings_through_table(&mut *conn, &session_id, &memory_embeddings)?;
+    let new_memories_json = serde_json::to_string(&memories)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    let now = now_ms();
+    conn.execute(
+        "UPDATE group_sessions SET memories = ?, updated_at = ? WHERE id = ?",
+        params![new_memories_json, now, &session_id],
+    )
+    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    if let Some(removed) = removed_embedding {
+        append_group_user_memory_event(
+            &conn,
+            &session_id,
+            serde_json::json!({
+                "name": "delete_memory",
+                "deletedMemoryId": removed.id,
+                "softDelete": false,
+                "memorySnapshot": serde_json::to_value(&removed)
+                    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?,
+                "timestamp": now,
+                "arguments": { "text": removed_text.unwrap_or_default() },
+            }),
+        )?;
+    }
+
+    // Return updated session
+    if let Some(session) = read_group_session(&conn, &session_id)? {
+        return Ok(Some(serde_json::to_string(&session).map_err(|e| {
+            crate::utils::err_to_string(module_path!(), line!(), e)
+        })?));
+    }
+    Ok(None)
+}
+
+/// Update a memory in a group session by index
+#[tauri::command]
+pub async fn group_session_update_memory(
+    app: tauri::AppHandle,
+    session_id: String,
+    memory_index: usize,
+    new_memory: String,
+    pool: State<'_, SwappablePool>,
+) -> Result<Option<String>, String> {
+    let mut conn = pool.get_connection()?;
+
+    // Read current memories and embeddings
+    let current_memories_json: String = conn
+        .query_row(
+            "SELECT memories FROM group_sessions WHERE id = ?",
+            params![&session_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?
+        .unwrap_or_else(|| "[]".to_string());
+
+    let mut memories: Vec<String> =
+        serde_json::from_str(&current_memories_json).unwrap_or_else(|_| vec![]);
+    let mut memory_embeddings = read_group_embeddings_with_fallback(&conn, &session_id)?;
+
+    // Update at index if valid
+    let previous_text = memories.get(memory_index).cloned();
+    if memory_index < memories.len() {
+        memories[memory_index] = new_memory.clone();
+    }
+
+    let mut edited_memory_id: Option<String> = None;
+    if memory_index < memory_embeddings.len() {
+        edited_memory_id = Some(memory_embeddings[memory_index].id.clone());
+        // Recompute embedding
+        let embedding = match crate::embedding::compute_embedding(app.clone(), new_memory.clone())
+            .await
+        {
+            Ok(vec) => vec,
+            Err(err) => {
+                crate::utils::log_warn(
+                        &app,
+                        "group_session_update_memory",
+                        format!(
+                            "embedding recomputation failed; reusing the previous embedding for this memory: {}",
+                            err
+                        ),
+                    );
+                memory_embeddings[memory_index].embedding.clone()
+            }
+        };
+
+        let token_count = match crate::embedding::tokenizer::count_tokens(&app, &new_memory) {
+            Ok(count) => count,
+            Err(err) => {
+                crate::utils::log_warn(
+                    &app,
+                    "group_session_update_memory",
+                    format!("token count failed; defaulting to 0: {}", err),
+                );
+                0
+            }
+        };
+        let (embedding_source_version, embedding_dimensions) =
+            match crate::embedding::resolve_active_embedding_signature(&app) {
+                Ok(sig) => sig,
+                Err(err) => {
+                    crate::utils::log_warn(
+                        &app,
+                        "group_session_update_memory",
+                        format!(
+                            "could not resolve active embedding signature; falling back to v3/512 (may mismatch stored vectors): {}",
+                            err
+                        ),
+                    );
+                    ("v3".to_string(), 512)
+                }
+            };
+
+        memory_embeddings[memory_index].text = new_memory;
+        memory_embeddings[memory_index].embedding = embedding;
+        memory_embeddings[memory_index].token_count = token_count as u32;
+        memory_embeddings[memory_index].embedding_source_version = Some(embedding_source_version);
+        memory_embeddings[memory_index].embedding_dimensions = Some(embedding_dimensions);
+    }
+
+    // Save back
+    write_group_embeddings_through_table(&mut *conn, &session_id, &memory_embeddings)?;
+    let new_memories_json = serde_json::to_string(&memories)
+        .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    let now = now_ms();
+    conn.execute(
+        "UPDATE group_sessions SET memories = ?, updated_at = ? WHERE id = ?",
+        params![new_memories_json, now, &session_id],
+    )
+    .map_err(|e| crate::utils::err_to_string(module_path!(), line!(), e))?;
+    if let Some(memory_id) = edited_memory_id {
+        append_group_user_memory_event(
+            &conn,
+            &session_id,
+            serde_json::json!({
+                "name": "update_memory",
+                "memoryId": memory_id,
+                "previousText": previous_text,
+                "timestamp": now,
+                "arguments": { "text": memories.get(memory_index).cloned().unwrap_or_default() },
+            }),
+        )?;
+    }
+
+    // Return updated session
+    if let Some(session) = read_group_session(&conn, &session_id)? {
+        return Ok(Some(serde_json::to_string(&session).map_err(|e| {
+            crate::utils::err_to_string(module_path!(), line!(), e)
+        })?));
+    }
+    Ok(None)
+}
+
+/// Toggle pin state for a memory in a group session
+#[tauri::command]
+pub fn group_session_toggle_memory_pin(
+    session_id: String,
+    memory_index: usize,
+    pool: State<'_, SwappablePool>,
+) -> Result<Option<String>, String> {
+    let mut conn = pool.get_connection()?;
+
+    let mut memory_embeddings = read_group_embeddings_with_fallback(&conn, &session_id)?;
+    let now = now_ms();
+
+    // Toggle pin at index if valid
+    let mut pin_event: Option<(String, bool, bool)> = None;
+    if memory_index < memory_embeddings.len() {
+        let previous_pinned = memory_embeddings[memory_index].is_pinned;
+        let next_pinned = !previous_pinned;
+        memory_embeddings[memory_index].is_pinned = next_pinned;
+        if next_pinned {
+            memory_embeddings[memory_index].is_cold = false;
+            memory_embeddings[memory_index].importance_score = 1.0;
+            memory_embeddings[memory_index].last_accessed_at = now;
+        }
+        pin_event = Some((
+            memory_embeddings[memory_index].id.clone(),
+            previous_pinned,
+            next_pinned,
+        ));
+    }
+
+    write_group_embeddings_through_table(&mut *conn, &session_id, &memory_embeddings)?;
+    if let Some((memory_id, previous_pinned, next_pinned)) = pin_event {
+        append_group_user_memory_event(
+            &conn,
+            &session_id,
+            serde_json::json!({
+                "name": if next_pinned { "pin_memory" } else { "unpin_memory" },
+                "memoryId": memory_id,
+                "previousPinned": previous_pinned,
+                "timestamp": now,
+                "arguments": { "id": memory_id },
+            }),
+        )?;
+    }
+
+    // Return updated session
+    if let Some(session) = read_group_session(&conn, &session_id)? {
+        return Ok(Some(serde_json::to_string(&session).map_err(|e| {
+            crate::utils::err_to_string(module_path!(), line!(), e)
+        })?));
+    }
+    Ok(None)
+}
+
+/// Set cold state for a memory in a group session
+#[tauri::command]
+pub fn group_session_set_memory_cold_state(
+    session_id: String,
+    memory_index: usize,
+    is_cold: bool,
+    pool: State<'_, SwappablePool>,
+) -> Result<Option<String>, String> {
+    let mut conn = pool.get_connection()?;
+
+    let mut memory_embeddings = read_group_embeddings_with_fallback(&conn, &session_id)?;
+    let now = now_ms();
+
+    let mut cold_event: Option<(String, bool)> = None;
+    if memory_index < memory_embeddings.len() {
+        if memory_embeddings[memory_index].is_pinned && is_cold {
+            return Err(crate::utils::err_msg(
+                module_path!(),
+                line!(),
+                "Pinned memories cannot be moved to cold storage",
+            ));
+        }
+        let previous_is_cold = memory_embeddings[memory_index].is_cold;
+        memory_embeddings[memory_index].is_cold = is_cold;
+        if is_cold {
+            memory_embeddings[memory_index].importance_score = 0.0;
+        } else {
+            memory_embeddings[memory_index].importance_score = 1.0;
+            memory_embeddings[memory_index].last_accessed_at = now;
+        }
+        cold_event = Some((memory_embeddings[memory_index].id.clone(), previous_is_cold));
+    }
+
+    write_group_embeddings_through_table(&mut *conn, &session_id, &memory_embeddings)?;
+    if let Some((memory_id, previous_is_cold)) = cold_event {
+        append_group_user_memory_event(
+            &conn,
+            &session_id,
+            serde_json::json!({
+                "name": "set_memory_cold",
+                "memoryId": memory_id,
+                "previousIsCold": previous_is_cold,
+                "timestamp": now,
+                "arguments": { "isCold": is_cold },
+            }),
+        )?;
+    }
+
+    // Return updated session
+    if let Some(session) = read_group_session(&conn, &session_id)? {
+        return Ok(Some(serde_json::to_string(&session).map_err(|e| {
+            crate::utils::err_to_string(module_path!(), line!(), e)
+        })?));
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
+mod group_config_tests {
+    use super::*;
+
+    fn session(config_overrides: serde_json::Value) -> GroupSession {
+        GroupSession {
+            id: "session".to_string(),
+            group_character_id: Some("profile".to_string()),
+            name: "Chat title".to_string(),
+            character_ids: vec!["legacy".to_string()],
+            muted_character_ids: Vec::new(),
+            persona_id: Some("legacy-persona".to_string()),
+            created_at: 1,
+            updated_at: 1,
+            archived: false,
+            chat_type: "conversation".to_string(),
+            starting_scene: None,
+            background_image_path: Some("legacy.png".to_string()),
+            lorebook_ids: Vec::new(),
+            disable_character_lorebooks: false,
+            memories: Vec::new(),
+            memory_embeddings: Vec::new(),
+            memory_summary: String::new(),
+            memory_summary_token_count: 0,
+            memory_tool_events: Vec::new(),
+            memory_status: "idle".to_string(),
+            memory_error: None,
+            memory_progress_step: None,
+            speaker_selection_method: "llm".to_string(),
+            memory_type: "manual".to_string(),
+            author_note: None,
+            character_model_overrides: BTreeMap::new(),
+            group_chat_prompt_template_id: None,
+            group_chat_roleplay_prompt_template_id: None,
+            config_overrides,
+        }
+    }
+
+    fn connection() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE group_characters (
+                id TEXT PRIMARY KEY,
+                character_ids TEXT NOT NULL,
+                muted_character_ids TEXT NOT NULL,
+                persona_id TEXT,
+                chat_type TEXT,
+                starting_scene TEXT,
+                background_image_path TEXT,
+                lorebook_ids TEXT,
+                disable_character_lorebooks INTEGER,
+                speaker_selection_method TEXT,
+                memory_type TEXT,
+                character_model_overrides TEXT,
+                group_chat_prompt_template_id TEXT,
+                group_chat_roleplay_prompt_template_id TEXT
+            );
+            INSERT INTO group_characters VALUES (
+                'profile', '[\"profile-character\"]', '[]', 'profile-persona',
+                'roleplay', '{\"content\":\"scene\"}', 'profile.png', '[\"lore\"]',
+                1, 'round_robin', 'dynamic',
+                '{\"profile-character\":\"profile-model\"}', 'profile-conversation-template',
+                'profile-roleplay-template'
+            );",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn missing_override_keys_follow_current_profile_values() {
+        let resolved = resolve_group_session_config(
+            &connection(),
+            session(serde_json::json!({ "version": 1 })),
+        )
+        .unwrap()
+        .0;
+        assert_eq!(resolved.character_ids, vec!["profile-character"]);
+        assert_eq!(resolved.persona_id.as_deref(), Some("profile-persona"));
+        assert_eq!(resolved.chat_type, "roleplay");
+        assert_eq!(resolved.memory_type, "dynamic");
+        assert_eq!(
+            resolved.background_image_path.as_deref(),
+            Some("profile.png")
+        );
+        assert_eq!(
+            resolved.character_model_overrides.get("profile-character"),
+            Some(&"profile-model".to_string())
+        );
+        assert_eq!(
+            resolved.group_chat_prompt_template_id.as_deref(),
+            Some("profile-conversation-template")
+        );
+        assert_eq!(
+            resolved.group_chat_roleplay_prompt_template_id.as_deref(),
+            Some("profile-roleplay-template")
+        );
+    }
+
+    #[test]
+    fn present_values_and_explicit_null_remain_session_overrides() {
+        let resolved = resolve_group_session_config(
+            &connection(),
+            session(serde_json::json!({
+                "version": 1,
+                "characterIds": ["override-character"],
+                "personaId": null,
+                "backgroundImagePath": null,
+                "memoryType": "manual",
+                "characterModelOverrides": { "override-character": "session-model" },
+                "groupChatRoleplayPromptTemplateId": null
+            })),
+        )
+        .unwrap()
+        .0;
+        assert_eq!(resolved.character_ids, vec!["override-character"]);
+        assert_eq!(resolved.persona_id, None);
+        assert_eq!(resolved.background_image_path, None);
+        assert_eq!(resolved.memory_type, "manual");
+        assert_eq!(
+            resolved.character_model_overrides.get("override-character"),
+            Some(&"session-model".to_string())
+        );
+        assert_eq!(resolved.group_chat_roleplay_prompt_template_id, None);
+    }
+
+    #[test]
+    fn double_encoded_starting_scene_resolves_to_an_object() {
+        let resolved = resolve_group_session_config(
+            &connection(),
+            session(serde_json::json!({
+                "version": 1,
+                "startingScene": "{\"id\":\"11111111-1111-4111-8111-111111111111\",\"content\":\"A quiet room\",\"createdAt\":10}"
+            })),
+        )
+        .unwrap()
+        .0;
+        let scene = resolved.starting_scene.expect("scene should resolve");
+        assert!(scene.is_object());
+        assert_eq!(scene["content"], "A quiet room");
+    }
+
+    #[test]
+    fn undecodable_starting_scene_override_resolves_to_none() {
+        let resolved = resolve_group_session_config(
+            &connection(),
+            session(serde_json::json!({
+                "version": 1,
+                "startingScene": "a plain sentence, not json"
+            })),
+        )
+        .unwrap()
+        .0;
+        assert_eq!(resolved.starting_scene, None);
+    }
+
+    #[test]
+    fn object_starting_scene_override_is_passed_through() {
+        let resolved = resolve_group_session_config(
+            &connection(),
+            session(serde_json::json!({
+                "version": 1,
+                "startingScene": { "id": "22222222-2222-4222-8222-222222222222", "content": "Direct", "createdAt": 20 }
+            })),
+        )
+        .unwrap()
+        .0;
+        let scene = resolved.starting_scene.expect("scene should resolve");
+        assert_eq!(scene["content"], "Direct");
+    }
+}

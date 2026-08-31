@@ -1,0 +1,1075 @@
+import { useEffect, useState, useMemo, useRef, useId } from "react";
+import { useParams, useNavigate, useLocation } from "react-router-dom";
+import {
+  BookOpen,
+  Trash2,
+  ChevronRight,
+  Star,
+  Edit2,
+  Search,
+  Sparkles,
+  GripVertical,
+  TestTube2,
+  X,
+  Download,
+  Loader2,
+} from "lucide-react";
+import { motion, type PanInfo, useDragControls } from "framer-motion";
+import type { Lorebook, LorebookEntry } from "../../../core/storage/schemas";
+import {
+  listLorebooks,
+  listLorebookEntries,
+  createBlankLorebookEntry,
+  saveLorebookEntry,
+  deleteLorebookEntry,
+  reorderLorebookEntries,
+  saveLorebook,
+} from "../../../core/storage/repo";
+import { convertToImageRef, deleteImageRef } from "../../../core/storage";
+import { convertFilePathToDataUrl } from "../../../core/storage/images";
+import {
+  buildAvatarLibrarySelectionKey,
+  type AvatarLibrarySelectionPayload,
+} from "../../components/AvatarPicker/librarySelection";
+import {
+  exportLorebook,
+  exportLorebookAsUsc,
+  downloadJson,
+  generateLorebookExportFilenameWithFormat,
+} from "../../../core/storage/lorebookTransfer";
+import {
+  BottomMenu,
+  LorebookExportMenu,
+  LorebookMetadataMenu,
+  MenuButton,
+} from "../../components";
+import { confirmBottomMenu } from "../../components/ConfirmBottomMenu";
+import { TopNav } from "../../components/App";
+import { Switch } from "../../components/Switch";
+import { useI18n } from "../../../core/i18n/context";
+import { Routes } from "../../navigation";
+import { toast } from "../../components/toast";
+import type { LorebookExportFormat } from "../../components/LorebookExportMenu";
+
+const DRAG_HOLD_MS = 450;
+
+function KeywordTagInput({
+  keywords,
+  onChange,
+  caseSensitive,
+  onCaseSensitiveChange,
+  keywordMatchMode,
+  onKeywordMatchModeChange,
+}: {
+  keywords: string[];
+  onChange: (keywords: string[]) => void;
+  caseSensitive: boolean;
+  onCaseSensitiveChange: (caseSensitive: boolean) => void;
+  keywordMatchMode: "literal" | "regex";
+  onKeywordMatchModeChange: (keywordMatchMode: "literal" | "regex") => void;
+}) {
+  const { t } = useI18n();
+  const [inputValue, setInputValue] = useState("");
+  const matchTypeLayoutId = useId();
+
+  const addKeyword = () => {
+    const newKeyword = inputValue.trim();
+    if (newKeyword && !keywords.includes(newKeyword)) {
+      onChange([...keywords, newKeyword]);
+      setInputValue("");
+    }
+  };
+
+  const removeKeyword = (index: number) => {
+    onChange(keywords.filter((_, i) => i !== index));
+  };
+
+  return (
+    <>
+    <div className="space-y-3">
+      <div>
+        <label className="text-[11px] font-medium text-fg/70">
+          {t(
+            keywordMatchMode === "regex"
+              ? "characters.lorebook.regularExpressionsLabel"
+              : "characters.lorebook.keywords",
+          )}
+        </label>
+      </div>
+
+      <div className="flex gap-2">
+        <input
+          value={inputValue}
+          onChange={(e) => setInputValue(e.target.value)}
+          placeholder={
+            keywordMatchMode === "regex"
+              ? t("characters.lorebook.regularExpressionPlaceholder")
+              : t("characters.lorebook.typeKeyword")
+          }
+          className="flex-1 rounded-xl border border-fg/10 bg-surface-el/20 px-3 py-2.5 text-fg placeholder-fg/40 transition focus:border-fg/30 focus:outline-none"
+        />
+        <button
+          type="button"
+          onClick={addKeyword}
+          disabled={!inputValue.trim()}
+          className="rounded-xl border border-accent/40 bg-accent/20 px-4 py-2.5 text-sm font-medium text-accent/70 transition hover:bg-accent/30 disabled:opacity-40 disabled:cursor-not-allowed"
+        >
+          {t("common.buttons.add")}
+        </button>
+      </div>
+
+      <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+        <label className="flex items-center gap-2 text-xs text-fg/50">
+          <span>{t("characters.lorebook.matchType")}</span>
+          <div className="inline-flex items-center gap-0.5 rounded-lg border border-fg/8 bg-fg/[0.025] p-0.5">
+            {(["literal", "regex"] as const).map((mode) => {
+              const active = keywordMatchMode === mode;
+              return (
+                <motion.button
+                  key={mode}
+                  type="button"
+                  onClick={() => onKeywordMatchModeChange(mode)}
+                  whileTap={{ scale: 0.97 }}
+                  transition={{ duration: 0.14 }}
+                  className={`relative z-10 rounded-md px-2.5 py-1 text-[11.5px] font-medium transition-colors ${
+                    active ? "text-fg" : "text-fg/45 hover:text-fg/80"
+                  }`}
+                >
+                  {active && (
+                    <motion.span
+                      layoutId={`lorebook-match-mode-${matchTypeLayoutId}`}
+                      className="absolute inset-0 -z-10 rounded-md bg-fg/10"
+                      transition={{ type: "spring", stiffness: 480, damping: 34 }}
+                    />
+                  )}
+                  <span>
+                    {mode === "regex"
+                      ? t("characters.lorebook.regularExpressions")
+                      : t("characters.lorebook.literalText")}
+                  </span>
+                </motion.button>
+              );
+            })}
+          </div>
+        </label>
+        <label className="flex items-center gap-2 text-xs text-fg/50">
+          <span>{t("characters.lorebook.caseSensitive")}</span>
+          <Switch checked={caseSensitive} onChange={onCaseSensitiveChange} />
+        </label>
+      </div>
+
+      {keywordMatchMode === "regex" && (
+        <p className="text-xs text-fg/50">{t("characters.lorebook.regularExpressionHint")}</p>
+      )}
+
+      {keywords.length > 0 && (
+        <div className="flex flex-wrap gap-2">
+          {keywords.map((keyword, index) => (
+            <button
+              key={`${keyword}-${index}`}
+              type="button"
+              onClick={() => removeKeyword(index)}
+              className="inline-flex items-center gap-1.5 rounded-full bg-fg/10 pl-3 pr-2 py-1.5 text-sm text-fg active:bg-fg/20 transition"
+            >
+              {keyword}
+              <span className="flex h-5 w-5 items-center justify-center rounded-full bg-fg/10">
+                <X size={12} className="text-fg/70" />
+              </span>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+    </>
+  );
+}
+
+function EntryEditorMenu({
+  entry,
+  isOpen,
+  onClose,
+  onSave,
+}: {
+  entry: LorebookEntry | null;
+  isOpen: boolean;
+  onClose: () => void;
+  onSave: (entry: LorebookEntry) => void;
+}) {
+  const { t } = useI18n();
+  const [draft, setDraft] = useState<LorebookEntry | null>(null);
+
+  useEffect(() => {
+    if (entry) {
+      setDraft({ ...entry });
+    }
+  }, [entry]);
+
+  if (!draft) return null;
+
+  const handleSave = () => {
+    onSave(draft);
+    onClose();
+  };
+
+  return (
+    <BottomMenu isOpen={isOpen} onClose={onClose} title={t("characters.lorebook.editEntry")}>
+      <div className="space-y-4">
+        {/* Title */}
+        <div className="space-y-2">
+          <label className="text-[11px] font-medium text-fg/70">
+            {t("characters.lorebook.titleLabel")}
+          </label>
+          <input
+            value={draft.title || ""}
+            onChange={(e) => setDraft({ ...draft, title: e.target.value })}
+            placeholder={t("characters.lorebook.titlePlaceholder")}
+            className="w-full rounded-xl border border-fg/10 bg-surface-el/20 px-3 py-2 text-fg placeholder-fg/40 transition focus:border-fg/30 focus:outline-none"
+          />
+        </div>
+
+        {/* Toggles */}
+        <div className="flex gap-3">
+          <div className="flex items-start justify-between gap-4 rounded-xl border border-fg/10 bg-surface-el/90 p-3 flex-1">
+            <div>
+              <label className="block text-sm font-semibold text-fg">
+                {t("characters.lorebook.enabled")}
+              </label>
+              <p className="mt-0.5 text-xs text-fg/50">
+                {t("characters.lorebook.includeInPrompts")}
+              </p>
+            </div>
+            <Switch
+              checked={draft.enabled}
+              onChange={(next) => setDraft({ ...draft, enabled: next })}
+            />
+          </div>
+
+          <div className="flex items-start justify-between gap-4 rounded-xl border border-fg/10 bg-surface-el/90 p-3 flex-1">
+            <div>
+              <label className="block text-sm font-semibold text-fg">
+                {t("characters.lorebook.alwaysOn")}
+              </label>
+              <p className="mt-0.5 text-xs text-fg/50">
+                {t("characters.lorebook.noKeywordsNeeded")}
+              </p>
+            </div>
+            <Switch
+              checked={draft.alwaysActive}
+              onChange={(next) => setDraft({ ...draft, alwaysActive: next })}
+            />
+          </div>
+        </div>
+
+        {/* Keywords */}
+        {!draft.alwaysActive && (
+          <KeywordTagInput
+            keywords={draft.keywords}
+            onChange={(keywords) => setDraft({ ...draft, keywords })}
+            caseSensitive={draft.caseSensitive}
+            onCaseSensitiveChange={(caseSensitive) => setDraft({ ...draft, caseSensitive })}
+            keywordMatchMode={draft.keywordMatchMode}
+            onKeywordMatchModeChange={(keywordMatchMode) =>
+              setDraft({ ...draft, keywordMatchMode })
+            }
+          />
+        )}
+
+        {/* Content */}
+        <div className="space-y-2">
+          <label className="text-[11px] font-medium text-fg/70">
+            {t("characters.lorebook.contentLabel")}
+          </label>
+          <textarea
+            value={draft.content}
+            onChange={(e) => setDraft({ ...draft, content: e.target.value })}
+            placeholder={t("characters.lorebook.contentPlaceholder")}
+            rows={8}
+            className="w-full resize-none rounded-xl border border-fg/10 bg-surface-el/20 px-3 py-2 text-fg placeholder-fg/40 transition focus:border-fg/30 focus:outline-none"
+          />
+        </div>
+
+        {/* Save Button */}
+        <button
+          onClick={handleSave}
+          disabled={
+            !draft.title?.trim() ||
+            !draft.content?.trim() ||
+            (!draft.alwaysActive && draft.keywords.length === 0)
+          }
+          className="w-full rounded-xl border border-accent/40 bg-accent/20 px-4 py-3.5 text-sm font-semibold text-accent/70 transition hover:bg-accent/30 disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {t("characters.lorebook.saveEntry")}
+        </button>
+      </div>
+    </BottomMenu>
+  );
+}
+
+function EntryListItem({
+  entry,
+  originalIndex,
+  isDragging,
+  onDrag,
+  onDragEnd,
+  onSelect,
+}: {
+  entry: LorebookEntry;
+  originalIndex: number;
+  isDragging: boolean;
+  onDrag: (fromIndex: number, info: { offset: { y: number } }) => void;
+  onDragEnd: (fromIndex: number, info: PanInfo) => void;
+  onSelect: (entry: LorebookEntry) => void;
+}) {
+  const controls = useDragControls();
+  const dragTimeoutRef = useRef<number | null>(null);
+  const draggingRef = useRef(false);
+  const pendingEventRef = useRef<PointerEvent | null>(null);
+  const scrollLockRef = useRef<{
+    el: HTMLElement;
+    overflow: string;
+    touchAction: string;
+    scrollTop: number;
+  } | null>(null);
+
+  const scheduleDragStart = (event: React.PointerEvent<HTMLButtonElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    pendingEventRef.current = event.nativeEvent;
+    if (event.pointerType === "mouse") {
+      draggingRef.current = true;
+      controls.start(event.nativeEvent);
+      return;
+    }
+    if (dragTimeoutRef.current) {
+      window.clearTimeout(dragTimeoutRef.current);
+    }
+    dragTimeoutRef.current = window.setTimeout(() => {
+      dragTimeoutRef.current = null;
+      const pendingEvent = pendingEventRef.current;
+      if (pendingEvent) {
+        draggingRef.current = true;
+        controls.start(pendingEvent);
+      }
+    }, DRAG_HOLD_MS);
+  };
+
+  const cancelDragStart = () => {
+    if (dragTimeoutRef.current) {
+      window.clearTimeout(dragTimeoutRef.current);
+      dragTimeoutRef.current = null;
+    }
+    pendingEventRef.current = null;
+  };
+
+  const lockScrollContainer = () => {
+    const scrollEl = document.querySelector("main") as HTMLElement | null;
+    if (!scrollEl || scrollLockRef.current) return;
+    scrollLockRef.current = {
+      el: scrollEl,
+      overflow: scrollEl.style.overflow,
+      touchAction: scrollEl.style.touchAction,
+      scrollTop: scrollEl.scrollTop,
+    };
+    scrollEl.style.overflow = "hidden";
+    scrollEl.style.touchAction = "none";
+  };
+
+  const unlockScrollContainer = () => {
+    if (!scrollLockRef.current) return;
+    const { el, overflow, touchAction, scrollTop } = scrollLockRef.current;
+    el.style.overflow = overflow;
+    el.style.touchAction = touchAction;
+    el.scrollTop = scrollTop;
+    scrollLockRef.current = null;
+  };
+
+  const { t } = useI18n();
+  const displayTitle =
+    entry.title?.trim() || entry.keywords[0] || t("characters.lorebook.untitledEntry");
+  const displaySubtitle = entry.alwaysActive
+    ? t("characters.lorebook.alwaysActive")
+    : entry.keywords.length > 0
+      ? entry.keywords.slice(0, 3).join(", ") + (entry.keywords.length > 3 ? "..." : "")
+      : t("characters.lorebook.noKeywords");
+
+  return (
+    <motion.div
+      layout
+      layoutId={entry.id}
+      drag="y"
+      dragListener={false}
+      dragControls={controls}
+      dragElastic={0.15}
+      dragMomentum={false}
+      dragSnapToOrigin
+      dragTransition={{ bounceStiffness: 300, bounceDamping: 25 }}
+      onDragStart={() => {
+        draggingRef.current = true;
+        document.body.style.overflow = "hidden";
+        document.body.style.touchAction = "none";
+        lockScrollContainer();
+      }}
+      onDrag={(_, info) => onDrag(originalIndex, info)}
+      onDragEnd={(_, info) => onDragEnd(originalIndex, info)}
+      onPointerMove={(event) => {
+        if (dragTimeoutRef.current) {
+          pendingEventRef.current = event.nativeEvent;
+        }
+        if (draggingRef.current) {
+          event.preventDefault();
+        }
+      }}
+      onPointerUp={(event) => {
+        cancelDragStart();
+        draggingRef.current = false;
+        event.currentTarget.releasePointerCapture?.(event.pointerId);
+        document.body.style.overflow = "";
+        document.body.style.touchAction = "";
+        unlockScrollContainer();
+      }}
+      onPointerCancel={(event) => {
+        cancelDragStart();
+        draggingRef.current = false;
+        event.currentTarget.releasePointerCapture?.(event.pointerId);
+        document.body.style.overflow = "";
+        document.body.style.touchAction = "";
+        unlockScrollContainer();
+      }}
+      whileDrag={{ scale: 1.03, zIndex: 50, boxShadow: "0 15px 40px rgba(0,0,0,0.5)" }}
+      transition={{ type: "spring", stiffness: 400, damping: 30 }}
+      className={`group relative flex w-full items-center gap-2 overflow-hidden rounded-xl border px-2 py-3 ${isDragging ? "opacity-0" : "cursor-grab active:cursor-grabbing"} ${
+        entry.enabled
+          ? "border-fg/10 bg-surface-el/90 hover:border-fg/25 hover:bg-surface-el/95"
+          : "border-fg/10 bg-surface-el/60 opacity-60 hover:opacity-80"
+      }`}
+    >
+      <button
+        type="button"
+        onPointerDown={scheduleDragStart}
+        onPointerUp={cancelDragStart}
+        onPointerLeave={cancelDragStart}
+        onPointerCancel={cancelDragStart}
+        onContextMenu={(event) => event.preventDefault()}
+        className="flex h-10 w-8 shrink-0 items-center justify-center text-fg/30"
+        style={{ touchAction: "none" }}
+        title={t("library.lorebookEditor.dragToReorder")}
+      >
+        <GripVertical size={18} />
+      </button>
+
+      <button
+        type="button"
+        onClick={() => onSelect(entry)}
+        className="flex flex-1 items-center gap-3 text-left active:scale-[0.995]"
+      >
+        <div
+          className={`relative flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border ${
+            entry.enabled
+              ? entry.alwaysActive
+                ? "border-info/40 bg-info/20"
+                : "border-accent/40 bg-accent/20"
+              : "border-fg/10 bg-fg/5"
+          }`}
+        >
+          <BookOpen
+            className={`h-5 w-5 ${
+              entry.enabled ? (entry.alwaysActive ? "text-info" : "text-accent/80") : "text-fg/40"
+            }`}
+          />
+        </div>
+
+        <div className="relative min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <h3 className="truncate text-sm font-semibold text-fg">{displayTitle}</h3>
+            {!entry.enabled && (
+              <span className="text-[10px] uppercase tracking-wide text-fg/40">
+                {t("characters.lorebook.disabled")}
+              </span>
+            )}
+          </div>
+          <p className="line-clamp-1 text-xs text-fg/50">{displaySubtitle}</p>
+        </div>
+
+        <span className="relative flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-fg/10 bg-fg/5 text-fg/70 group-hover:border-fg/25 group-hover:text-fg transition">
+          <ChevronRight size={16} />
+        </span>
+      </button>
+    </motion.div>
+  );
+}
+
+export function StandaloneLorebookEditor() {
+  const { t } = useI18n();
+  const { lorebookId } = useParams<{ lorebookId: string }>();
+  const navigate = useNavigate();
+  const location = useLocation();
+  const returnPath = `${location.pathname}${location.search}`;
+
+  const [lorebook, setLorebook] = useState<Lorebook | null>(null);
+  const [entries, setEntries] = useState<LorebookEntry[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [editingEntry, setEditingEntry] = useState<LorebookEntry | null>(null);
+  const [selectedEntry, setSelectedEntry] = useState<LorebookEntry | null>(null);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [dragState, setDragState] = useState<{ fromIndex: number; toIndex: number } | null>(null);
+
+  // Rename lorebook state
+  const [showRenameMenu, setShowRenameMenu] = useState(false);
+  const [newName, setNewName] = useState("");
+  const [avatarDraftPath, setAvatarDraftPath] = useState<string | null>(null);
+  const [keywordDetectionModeDraft, setKeywordDetectionModeDraft] =
+    useState<Lorebook["keywordDetectionMode"]>("recentMessageWindow");
+  const [isCreatingEntry, setIsCreatingEntry] = useState(false);
+  const [isExporting, setIsExporting] = useState(false);
+  const [showExportMenu, setShowExportMenu] = useState(false);
+  const avatarInputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    loadData();
+  }, [lorebookId]);
+
+  const loadData = async () => {
+    if (!lorebookId) return;
+    try {
+      setIsLoading(true);
+      const [allLorebooks, ent] = await Promise.all([
+        listLorebooks(),
+        listLorebookEntries(lorebookId),
+      ]);
+      const lb = allLorebooks.find((l) => l.id === lorebookId) ?? null;
+      setLorebook(lb);
+      setKeywordDetectionModeDraft(lb?.keywordDetectionMode ?? "recentMessageWindow");
+      setEntries(ent);
+    } catch (error) {
+      console.error("Failed to load lorebook:", error);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Listen for add event from plus button
+  useEffect(() => {
+    const handleAdd = () => handleCreateEntry();
+    window.addEventListener("lorebook:add", handleAdd);
+    return () => window.removeEventListener("lorebook:add", handleAdd);
+  }, [lorebookId]);
+
+  const handleCreateEntry = () => {
+    setIsCreatingEntry(true);
+    // Temporary placeholder entry for the editor
+    setEditingEntry({
+      id: "", // Will be assigned on save
+      lorebookId: lorebookId || "",
+      title: "",
+      content: "",
+      keywords: [],
+      enabled: true,
+      alwaysActive: false,
+      caseSensitive: false,
+      keywordMatchMode: "literal",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      displayOrder: entries.length,
+      priority: 0,
+    });
+  };
+
+  const handleSaveEntry = async (entry: LorebookEntry) => {
+    try {
+      if (isCreatingEntry) {
+        if (!lorebookId) return;
+        // Create brand new entry with the data
+        const created = await createBlankLorebookEntry(lorebookId);
+        const fullEntry = {
+          ...created,
+          title: entry.title,
+          content: entry.content,
+          keywords: entry.keywords,
+          enabled: entry.enabled,
+          alwaysActive: entry.alwaysActive,
+          caseSensitive: entry.caseSensitive,
+          keywordMatchMode: entry.keywordMatchMode,
+        };
+        await saveLorebookEntry(fullEntry);
+        setEntries((prev) => [...prev, fullEntry]);
+        setIsCreatingEntry(false);
+      } else {
+        await saveLorebookEntry(entry);
+        setEntries((prev) => prev.map((e) => (e.id === entry.id ? entry : e)));
+      }
+    } catch (error) {
+      console.error("Failed to save entry:", error);
+    }
+  };
+
+  const handleDeleteEntry = async (id: string) => {
+    try {
+      await deleteLorebookEntry(id);
+      setEntries((prev) => prev.filter((e) => e.id !== id));
+    } catch (error) {
+      console.error("Failed to delete entry:", error);
+    }
+  };
+
+  const handleToggleEntry = async (entry: LorebookEntry, enabled: boolean) => {
+    try {
+      const updated = { ...entry, enabled };
+      await saveLorebookEntry(updated);
+      setEntries((prev) => prev.map((e) => (e.id === entry.id ? { ...e, enabled } : e)));
+    } catch (error) {
+      console.error("Failed to toggle entry:", error);
+    }
+  };
+
+  const handleReorderEntries = async (reorderedEntries: LorebookEntry[]) => {
+    try {
+      const updates = reorderedEntries.map((e, i) => [e.id, i] as [string, number]);
+      await reorderLorebookEntries(updates);
+      setEntries(reorderedEntries.map((e, i) => ({ ...e, displayOrder: i })));
+    } catch (error) {
+      console.error("Failed to reorder entries:", error);
+    }
+  };
+
+  const handleRename = async () => {
+    if (!lorebook || !newName.trim()) return;
+    let replacementAvatarPath: string | undefined;
+    try {
+      let nextAvatarPath = lorebook.avatarPath;
+
+      if (!avatarDraftPath) {
+        nextAvatarPath = undefined;
+      } else if (avatarDraftPath.startsWith("data:")) {
+        const storedAvatarPath = await convertToImageRef(avatarDraftPath);
+        if (!storedAvatarPath) {
+          throw new Error("Failed to save lorebook image");
+        }
+        nextAvatarPath = storedAvatarPath;
+        replacementAvatarPath = storedAvatarPath;
+      } else {
+        nextAvatarPath = avatarDraftPath;
+      }
+
+      const updated = {
+        ...lorebook,
+        name: newName.trim(),
+        avatarPath: nextAvatarPath,
+        keywordDetectionMode: keywordDetectionModeDraft,
+      };
+      const saved = await saveLorebook(updated);
+      if (lorebook.avatarPath && lorebook.avatarPath !== saved.avatarPath) {
+        await deleteImageRef(lorebook.avatarPath);
+      }
+      setLorebook(saved);
+      setShowRenameMenu(false);
+      setNewName("");
+      setAvatarDraftPath(saved.avatarPath ?? null);
+      setKeywordDetectionModeDraft(saved.keywordDetectionMode);
+    } catch (error) {
+      if (replacementAvatarPath) {
+        await deleteImageRef(replacementAvatarPath);
+      }
+      console.error("Failed to rename lorebook:", error);
+    }
+  };
+
+  const handleAvatarFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      setAvatarDraftPath(typeof reader.result === "string" ? reader.result : null);
+    };
+    reader.readAsDataURL(file);
+    event.target.value = "";
+  };
+
+  const handleChooseAvatarFromLibrary = () => {
+    if (!lorebook) return;
+    const draftPayload = {
+      lorebookId: lorebook.id,
+      nameDraft: newName,
+      keywordMode: keywordDetectionModeDraft,
+      avatarDraft: avatarDraftPath,
+    };
+    sessionStorage.setItem(
+      `lorebook-metadata-draft:${returnPath}`,
+      JSON.stringify(draftPayload),
+    );
+    navigate("/library/images/pick", {
+      state: { returnPath, selectionKind: "avatar" },
+    });
+  };
+
+  useEffect(() => {
+    if (isLoading || !lorebook) return;
+
+    const selectionKey = buildAvatarLibrarySelectionKey(returnPath);
+    const rawSelection = sessionStorage.getItem(selectionKey);
+    if (!rawSelection) return;
+    sessionStorage.removeItem(selectionKey);
+
+    const draftKey = `lorebook-metadata-draft:${returnPath}`;
+    const rawDraft = sessionStorage.getItem(draftKey);
+    sessionStorage.removeItem(draftKey);
+
+    let parsed: AvatarLibrarySelectionPayload | null = null;
+    try {
+      parsed = JSON.parse(rawSelection) as AvatarLibrarySelectionPayload;
+    } catch {
+      return;
+    }
+    if (!parsed?.filePath) return;
+
+    let draft:
+      | {
+          lorebookId?: string;
+          nameDraft?: string;
+          keywordMode?: Lorebook["keywordDetectionMode"];
+          avatarDraft?: string | null;
+        }
+      | null = null;
+    if (rawDraft) {
+      try {
+        draft = JSON.parse(rawDraft);
+      } catch {}
+    }
+
+    let cancelled = false;
+    void (async () => {
+      const dataUrl = await convertFilePathToDataUrl(parsed.filePath);
+      if (cancelled || !dataUrl) return;
+      if (draft && draft.lorebookId === lorebook.id) {
+        if (typeof draft.nameDraft === "string") setNewName(draft.nameDraft);
+        if (draft.keywordMode) setKeywordDetectionModeDraft(draft.keywordMode);
+      }
+      setAvatarDraftPath(dataUrl);
+      setShowRenameMenu(true);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [isLoading, lorebook, returnPath]);
+
+  const handleExportLorebook = async (format: LorebookExportFormat) => {
+    if (!lorebook || isExporting) return;
+    try {
+      setIsExporting(true);
+      const exportJson =
+        format === "usc"
+          ? await exportLorebookAsUsc(lorebook.id)
+          : await exportLorebook(lorebook.id);
+      await downloadJson(
+        exportJson,
+        generateLorebookExportFilenameWithFormat(lorebook.name, format),
+      );
+      setShowExportMenu(false);
+    } catch (error) {
+      console.error("Failed to export lorebook:", error);
+      toast.error(t("library.errors.exportFailed"), String(error));
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
+  const filteredEntries = useMemo(() => {
+    if (!searchQuery.trim()) return entries;
+    const query = searchQuery.toLowerCase();
+    return entries.filter((e) => {
+      const title = e.title?.toLowerCase() || "";
+      const content = e.content?.toLowerCase() || "";
+      const keywords = e.keywords.map((k) => k.toLowerCase()).join(" ");
+      return title.includes(query) || content.includes(query) || keywords.includes(query);
+    });
+  }, [entries, searchQuery]);
+
+  const displayEntries = useMemo(() => {
+    if (!dragState || dragState.fromIndex === dragState.toIndex) {
+      return filteredEntries;
+    }
+    const result = [...filteredEntries];
+    const [removed] = result.splice(dragState.fromIndex, 1);
+    result.splice(dragState.toIndex, 0, removed);
+    return result;
+  }, [filteredEntries, dragState]);
+
+  const handleDrag = (fromIndex: number, info: { offset: { y: number } }) => {
+    const offsetSlots = Math.round(info.offset.y / 70);
+    const toIndex = Math.max(0, Math.min(entries.length - 1, fromIndex + offsetSlots));
+    setDragState({ fromIndex, toIndex });
+  };
+
+  const handleDragEnd = (fromIndex: number, info: PanInfo) => {
+    const offsetSlots = Math.round(info.offset.y / 70);
+    const toIndex = Math.max(0, Math.min(entries.length - 1, fromIndex + offsetSlots));
+
+    if (fromIndex !== toIndex) {
+      const reordered = [...entries];
+      const [removed] = reordered.splice(fromIndex, 1);
+      reordered.splice(toIndex, 0, removed);
+      handleReorderEntries(reordered);
+    }
+    setDragState(null);
+  };
+
+  if (isLoading) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-surface">
+        <div className="h-10 w-10 animate-spin rounded-full border-4 border-fg/10 border-t-white/60" />
+      </div>
+    );
+  }
+
+  if (!lorebook) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-surface px-4">
+        <div className="text-center">
+          <p className="text-lg text-fg">{t("characters.lorebookPreview.untitledLorebook")}</p>
+          <button
+            onClick={() => navigate("/library")}
+            className="mt-4 text-sm text-fg/60 hover:text-fg"
+          >
+            {t("common.buttons.back")}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <>
+      <TopNav
+        currentPath="/library/lorebooks"
+        titleOverride={t("library.lorebookEditor.titleOverride", { name: lorebook.name })}
+        onBackOverride={() => navigate("/library")}
+        rightAction={
+          <div className="flex items-center gap-1">
+            <button
+              onClick={() => navigate(Routes.libraryLorebookGenerate(lorebook.id))}
+              className="flex items-center px-[0.6em] py-[0.3em] justify-center rounded-full text-fg/70 hover:text-fg hover:bg-fg/10 transition"
+              aria-label={t("library.lorebookEditor.aria.generateEntry")}
+            >
+              <Sparkles size={18} className="text-fg" />
+            </button>
+            <button
+              onClick={() => {
+                setNewName(lorebook.name);
+                setAvatarDraftPath(lorebook.avatarPath ?? null);
+                setKeywordDetectionModeDraft(lorebook.keywordDetectionMode);
+                setShowRenameMenu(true);
+              }}
+              className="flex items-center px-[0.6em] py-[0.3em] justify-center rounded-full text-fg/70 hover:text-fg hover:bg-fg/10 transition"
+              aria-label={t("library.lorebookEditor.aria.editLorebook")}
+            >
+              <Edit2 size={18} className="text-fg" />
+            </button>
+            <button
+              onClick={() => setShowExportMenu(true)}
+              disabled={isExporting}
+              className="flex items-center px-[0.6em] py-[0.3em] justify-center rounded-full text-fg/70 hover:text-fg hover:bg-fg/10 transition disabled:opacity-50 disabled:cursor-not-allowed"
+              aria-label={t("library.lorebookEditor.aria.exportLorebook")}
+            >
+              {isExporting ? (
+                <Loader2 size={18} className="animate-spin text-fg" />
+              ) : (
+                <Download size={18} className="text-fg" />
+              )}
+            </button>
+          </div>
+        }
+      />
+      <LorebookExportMenu
+        isOpen={showExportMenu}
+        onClose={() => {
+          if (isExporting) return;
+          setShowExportMenu(false);
+        }}
+        onSelect={(format) => {
+          void handleExportLorebook(format);
+        }}
+        exporting={isExporting}
+      />
+      <div className="flex h-full flex-col text-fg/80 overflow-hidden pb-6 pt-[calc(72px+env(safe-area-inset-top))]">
+        {/* Search */}
+        {entries.length > 0 && (
+          <div className="flex items-center gap-2 px-4 py-3">
+            <div className="relative flex-1">
+              <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-fg/40" />
+              <input
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder={t("characters.lorebook.searchEntries")}
+                className="w-full rounded-xl border border-fg/10 bg-surface-el/20 pl-9 pr-4 py-2 text-sm text-fg placeholder-fg/40 transition focus:border-fg/30 focus:outline-none"
+              />
+            </div>
+            <button
+              type="button"
+              onClick={() => navigate(Routes.libraryLorebookPreview(lorebook.id))}
+              className="flex shrink-0 items-center gap-1.5 rounded-xl border border-fg/10 bg-surface-el/20 px-3 py-2 text-xs font-medium text-fg/70 transition hover:border-fg/25 hover:text-fg"
+              title={t("characters.lorebook.preview.openButton")}
+            >
+              <TestTube2 className="h-3.5 w-3.5" />
+              <span className="hidden sm:inline">{t("characters.lorebook.preview.openButton")}</span>
+            </button>
+          </div>
+        )}
+
+        {/* Entry List */}
+        <main className="flex-1 overflow-y-auto overflow-x-hidden px-4 pb-6">
+          {entries.length === 0 ? (
+            <div className="flex h-64 flex-col items-center justify-center">
+              <BookOpen className="mb-3 h-12 w-12 text-fg/20" />
+              <h3 className="mb-1 text-lg font-medium text-fg">
+                {t("characters.lorebook.noEntriesYet")}
+              </h3>
+              <p className="mb-4 text-center text-sm text-fg/50">
+                {t("characters.lorebook.addEntriesToInject")}
+              </p>
+              <button
+                onClick={handleCreateEntry}
+                className="rounded-full border border-accent/40 bg-accent/20 px-6 py-2 text-sm font-medium text-accent/70 transition hover:bg-accent/30"
+              >
+                {t("characters.lorebook.createEntry")}
+              </button>
+            </div>
+          ) : filteredEntries.length === 0 ? (
+            <div className="flex h-32 flex-col items-center justify-center text-fg/50">
+              <p>{t("characters.lorebook.noMatchingEntries")}</p>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {displayEntries.map((entry) => {
+                const originalIndex = filteredEntries.findIndex((e) => e.id === entry.id);
+                const isDragging = dragState?.fromIndex === originalIndex;
+
+                return (
+                  <EntryListItem
+                    key={entry.id}
+                    entry={entry}
+                    originalIndex={originalIndex}
+                    isDragging={isDragging}
+                    onDrag={handleDrag}
+                    onDragEnd={handleDragEnd}
+                    onSelect={setSelectedEntry}
+                  />
+                );
+              })}
+            </div>
+          )}
+        </main>
+
+        {/* Entry Actions Menu */}
+        <BottomMenu
+          isOpen={Boolean(selectedEntry)}
+          onClose={() => setSelectedEntry(null)}
+          title={
+            selectedEntry?.title ||
+            selectedEntry?.keywords[0] ||
+            t("characters.lorebook.entryDefaultName")
+          }
+        >
+          {selectedEntry && (
+            <div className="space-y-2">
+              <MenuButton
+                icon={Edit2}
+                title={t("characters.lorebook.editEntry")}
+                description={t("characters.lorebook.editEntryDesc")}
+                color="from-info to-info/80"
+                onClick={() => {
+                  setEditingEntry(selectedEntry);
+                  setSelectedEntry(null);
+                }}
+              />
+
+              <MenuButton
+                icon={Star}
+                title={
+                  selectedEntry.enabled
+                    ? t("characters.lorebook.disableEntry")
+                    : t("characters.lorebook.enableEntry")
+                }
+                description={
+                  selectedEntry.enabled
+                    ? t("characters.lorebook.entryDisabledDesc")
+                    : t("characters.lorebook.entryEnabledDesc")
+                }
+                color="from-accent to-accent/80"
+                onClick={() => {
+                  handleToggleEntry(selectedEntry, !selectedEntry.enabled);
+                  setSelectedEntry(null);
+                }}
+              />
+
+              <button
+                onClick={async () => {
+                  const confirmed = await confirmBottomMenu({
+                    title: t("characters.lorebook.deleteEntry") + "?",
+                    message: t("characters.lorebook.deleteConfirmMessage"),
+                    confirmLabel: t("common.buttons.delete"),
+                    destructive: true,
+                  });
+                  if (!confirmed) return;
+                  handleDeleteEntry(selectedEntry.id);
+                  setSelectedEntry(null);
+                }}
+                className="flex w-full items-center gap-3 rounded-xl border border-danger/30 bg-danger/10 px-4 py-3 text-left transition hover:border-danger/50 hover:bg-danger/20"
+              >
+                <div className="flex h-8 w-8 items-center justify-center rounded-lg border border-danger/30 bg-danger/20">
+                  <Trash2 className="h-4 w-4 text-danger" />
+                </div>
+                <span className="text-sm font-medium text-danger">
+                  {t("characters.lorebook.deleteEntry")}
+                </span>
+              </button>
+            </div>
+          )}
+        </BottomMenu>
+
+        {/* Entry Editor */}
+        <EntryEditorMenu
+          entry={editingEntry}
+          isOpen={Boolean(editingEntry)}
+          onClose={() => {
+            setEditingEntry(null);
+            setIsCreatingEntry(false);
+          }}
+          onSave={handleSaveEntry}
+        />
+
+        {/* Rename Menu */}
+        <LorebookMetadataMenu
+          isOpen={showRenameMenu}
+          onClose={() => {
+            setShowRenameMenu(false);
+            setNewName("");
+            setAvatarDraftPath(lorebook.avatarPath ?? null);
+            setKeywordDetectionModeDraft(lorebook.keywordDetectionMode);
+          }}
+          title={t("library.actions.renameLorebook")}
+          nameValue={newName}
+          previewName={newName.trim() || lorebook.name}
+          namePlaceholder={t("characters.lorebook.enterNamePlaceholder")}
+          avatarPath={avatarDraftPath}
+          avatarInputRef={avatarInputRef}
+          onNameChange={setNewName}
+          onNameSubmit={handleRename}
+          onAvatarFileChange={handleAvatarFileChange}
+          onAvatarRemove={() => setAvatarDraftPath(null)}
+          onChooseFromLibrary={handleChooseAvatarFromLibrary}
+          keywordDetectionMode={keywordDetectionModeDraft}
+          onKeywordDetectionModeChange={setKeywordDetectionModeDraft}
+          onSave={handleRename}
+          saveDisabled={
+            !newName.trim() ||
+            (newName.trim() === lorebook.name &&
+              (avatarDraftPath ?? "") === (lorebook.avatarPath ?? "") &&
+              keywordDetectionModeDraft === lorebook.keywordDetectionMode)
+          }
+        />
+      </div>
+    </>
+  );
+}

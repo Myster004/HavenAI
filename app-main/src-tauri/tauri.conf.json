@@ -1,0 +1,105 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "MYnestAI",
+  "version": "1.2.0",
+  "identifier": "com.havenai.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "MYnestAI",
+        "width": 1440,
+        "height": 810,
+        "minWidth": 1068,
+        "minHeight": 600,
+        "transparent": true,
+        "decorations": false
+      }
+    ],
+    "security": {
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["$APPDATA/**"]
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "fileAssociations": [
+      {
+        "ext": ["uec"],
+        "name": "MYnestAI Unified Entity Card",
+        "description": "MYnestAI Unified Entity Card",
+        "role": "Editor",
+        "mimeType": "application/x-uec+json",
+        "rank": "Owner",
+        "exportedType": {
+          "identifier": "com.havenai.uec",
+          "conformsTo": ["public.json"]
+        }
+      },
+      {
+        "ext": ["usc"],
+        "name": "MYnestAI Unified System Card",
+        "description": "MYnestAI Unified System Card",
+        "role": "Editor",
+        "mimeType": "application/x-usc+json",
+        "rank": "Owner",
+        "exportedType": {
+          "identifier": "com.havenai.usc",
+          "conformsTo": ["public.json"]
+        }
+      },
+      {
+        "ext": ["zip"],
+        "name": "MYnestAI Backup",
+        "description": "MYnestAI encrypted backup",
+        "role": "Editor",
+        "mimeType": "application/zip",
+        "rank": "Owner",
+        "exportedType": {
+          "identifier": "com.havenai.backup",
+          "conformsTo": ["public.zip-archive", "public.data"]
+        }
+      }
+    ],
+    "macOS": {
+      "minimumSystemVersion": "11.0",
+      "signingIdentity": "-",
+      "dmg": {
+        "windowSize": {
+          "width": 660,
+          "height": 400
+        },
+        "appPosition": {
+          "x": 180,
+          "y": 170
+        },
+        "applicationFolderPosition": {
+          "x": 480,
+          "y": 170
+        }
+      }
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": [
+      "./onnxruntime",
+      "./feedback_sounds/fail.mp3",
+      "./feedback_sounds/send.mp3",
+      "./feedback_sounds/success.mp3"
+    ]
+  }
+}

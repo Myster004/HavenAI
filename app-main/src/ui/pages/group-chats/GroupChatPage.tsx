@@ -1,0 +1,2551 @@
+import { useEffect, useState, useRef, useCallback, useMemo, useLayoutEffect } from "react";
+import { useParams, useNavigate, useSearchParams } from "react-router-dom";
+import { ChevronDown, Loader2, Sparkles, Image, RefreshCw, PenLine, Check } from "lucide-react";
+import { motion, AnimatePresence } from "framer-motion";
+import { listen, UnlistenFn } from "@tauri-apps/api/event";
+import { impactFeedback } from "@tauri-apps/plugin-haptics";
+import { type as getPlatform } from "@tauri-apps/plugin-os";
+
+import { storageBridge } from "../../../core/storage/files";
+import {
+  createBranchedSessionFromGroupMessage,
+  generateGroupChatUserReply,
+  listAllGroupMessages,
+  readSettings,
+  SETTINGS_UPDATED_EVENT,
+  toggleGroupMessagePin,
+  updateGroupChatAppearance,
+  updateGroupSessionAuthorNote,
+  saveCharacter,
+} from "../../../core/storage/repo";
+import { useI18n } from "../../../core/i18n/context";
+import type {
+  Character,
+  GroupMessage,
+  GroupParticipation,
+  ImageAttachment,
+  Model,
+  Session,
+} from "../../../core/storage/schemas";
+import { radius, interactive, cn } from "../../design-tokens";
+import { useGroupChatLayoutContext } from "./GroupChatLayout";
+import { useAuthorNoteInlineEditor } from "../chats/components/useAuthorNoteInlineEditor";
+import { getChatWidgetLayout, useViewportWidth } from "../chats/utils/chatWidgetLayout";
+import { ChatWidgetArea } from "../chats/components/ChatWidgetArea";
+import {
+  WidgetContextProvider,
+  WidgetEditProvider,
+  type WidgetActionContext,
+  type WidgetSlots,
+} from "../chats/components/widgets";
+import {
+  patchWidgetNode,
+  setScratchPadContentOnNode,
+} from "../chats/components/widgets/editor/widgetFactories";
+import type { WidgetNode } from "../../../core/storage/chatWidgetSchemas";
+import { splitThinkTags } from "../../../core/utils/thinkTags";
+
+import { Routes } from "../../navigation";
+import { useBeetrootRain } from "../chats/components/BeetrootRain";
+import { getChatColumnLayout } from "../chats/utils/chatColumnLayout";
+import { useBeetrootEasterEgg } from "../chats/hooks/useBeetrootEasterEgg";
+import { BottomMenu, MenuButton } from "../../components/BottomMenu";
+import { DynamicMemoryApprovalGate } from "../../components/DynamicMemoryApprovalGate";
+import {
+  asrCorrectionUpsert,
+  asrIgnoreSuggestion,
+  asrSuggestCorrectionsFromEdit,
+  asrWhisperListInstalledModels,
+  asrWhisperTranscribePcm,
+  micConstraintsWithStoredDevice,
+  type AsrInstalledWhisperModel,
+  type AsrLearnedSuggestion,
+} from "../../../core/asr";
+import {
+  GroupChatFooter,
+  GroupChatHeader,
+  GroupChatAppearanceDrawer,
+  GroupChatSettingsDrawer,
+  GroupInlineAuthorNoteBar,
+  GroupChatMessage,
+  GroupChatMessageActionsBottomSheet,
+  type VariantState,
+} from "./components";
+import { GuidedTour, useGuidedTour } from "../../components/GuidedTour";
+
+const MESSAGES_PAGE_SIZE = 50;
+const STICKY_BOTTOM_THRESHOLD_PX = 80;
+const MOBILE_KEYBOARD_THRESHOLD_PX = 120;
+
+interface MessageActionState {
+  message: GroupMessage;
+  mode: "view" | "edit";
+}
+
+const isAbortMessage = (message: string) => {
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes("aborted") ||
+    normalized.includes("cancelled") ||
+    normalized.includes("canceled")
+  );
+};
+
+export function GroupChatPage() {
+  const { t } = useI18n();
+  const { groupSessionId } = useParams<{ groupSessionId: string }>();
+  const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
+
+  // State variables
+  const [messages, setMessages] = useState<GroupMessage[]>([]);
+  const [totalMessageCount, setTotalMessageCount] = useState(0);
+  const beetrootRain = useBeetrootRain();
+  useBeetrootEasterEgg({ messages, fire: beetrootRain.fire });
+  const [_participationStats, setParticipationStats] = useState<GroupParticipation[]>([]);
+  const [loading, setLoading] = useState(true);
+  const { shouldShow: showGroupTour, dismiss: dismissGroupTour } =
+    useGuidedTour("groupChatDetail");
+  const [sending, setSending] = useState(false);
+  const [sendingStatus, setSendingStatus] = useState<"selecting" | "generating" | null>(null);
+  const [_selectedCharacterId, setSelectedCharacterId] = useState<string | null>(null);
+  const assistantPlaceholderIdRef = useRef<string | null>(null);
+  const [_selectedCharacterName, setSelectedCharacterName] = useState<string | null>(null);
+  const [_selectedCharacterAvatarUrl, setSelectedCharacterAvatarUrl] = useState<string | null>(
+    null,
+  );
+  const [regeneratingMessageId, setRegeneratingMessageId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [draft, setDraft] = useState("");
+
+  // Plus menu & Help Me Reply states
+  const [showPlusMenu, setShowPlusMenu] = useState(false);
+  const [showChoiceMenu, setShowChoiceMenu] = useState(false);
+  const [showResultMenu, setShowResultMenu] = useState(false);
+  const [generatedReply, setGeneratedReply] = useState<string | null>(null);
+  const [generatingReply, setGeneratingReply] = useState(false);
+  const [helpMeReplyReasoning, setHelpMeReplyReasoning] = useState(false);
+  const [helpMeReplyError, setHelpMeReplyError] = useState<string | null>(null);
+  const [shouldTriggerFileInput, setShouldTriggerFileInput] = useState(false);
+  const [pendingAttachments, setPendingAttachments] = useState<ImageAttachment[]>([]);
+  const [supportsImageInput, setSupportsImageInput] = useState(false);
+  const footerRecorderRef = useRef<{
+    stream: MediaStream;
+    audioContext: AudioContext;
+    source: MediaStreamAudioSourceNode;
+    processor: ScriptProcessorNode;
+    analyser: AnalyserNode;
+    chunks: Float32Array[];
+    sampleRate: number;
+    startedAt: number;
+  } | null>(null);
+  const footerRecordingTimerRef = useRef<number | null>(null);
+  const [footerAsrMode, setFooterAsrMode] = useState<
+    "idle" | "recording" | "transcribing"
+  >("idle");
+  const [footerRecordingMs, setFooterRecordingMs] = useState(0);
+  const [footerAnalyser, setFooterAnalyser] = useState<AnalyserNode | null>(null);
+  const [footerAsrBusy, setFooterAsrBusy] = useState(false);
+  const [footerAsrRawText, setFooterAsrRawText] = useState("");
+  const [footerAsrBaseText, setFooterAsrBaseText] = useState("");
+  const [footerAsrSuggestions, setFooterAsrSuggestions] = useState<AsrLearnedSuggestion[]>([]);
+  const [footerAsrLearning, setFooterAsrLearning] = useState(false);
+  const [installedWhisperModels, setInstalledWhisperModels] = useState<
+    AsrInstalledWhisperModel[]
+  >([]);
+  const [keyboardInset, setKeyboardInset] = useState(0);
+  const [directorSelectedId, setDirectorSelectedId] = useState<string | null>(null);
+  const [directorWiggleNonce, setDirectorWiggleNonce] = useState(0);
+  const helpMeReplyRequestIdRef = useRef<string | null>(null);
+  const helpMeReplyUnlistenRef = useRef<UnlistenFn | null>(null);
+  const helpMeReplyLoadingTimeoutRef = useRef<number | null>(null);
+  const hapticsEnabledRef = useRef(false);
+  const hapticIntensityRef = useRef<any>("light");
+  const lastHapticTimeRef = useRef(0);
+  const platformRef = useRef("");
+
+  // Message actions state
+  const [messageAction, setMessageAction] = useState<MessageActionState | null>(null);
+  const [editDraft, setEditDraft] = useState("");
+  const [actionBusy, setActionBusy] = useState(false);
+  const [actionStatus, setActionStatus] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [heldMessageId, setHeldMessageId] = useState<string | null>(null);
+  const [appearanceDrawerOpen, setAppearanceDrawerOpen] = useState(false);
+  const [settingsDrawerOpen, setSettingsDrawerOpen] = useState(false);
+  const inlineAuthorNoteEnabled = useAuthorNoteInlineEditor();
+
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const isAtBottomRef = useRef(true);
+  const [isAtBottom, setIsAtBottom] = useState(true);
+  const activeRequestIdRef = useRef<string | null>(null);
+  const messagesRef = useRef<GroupMessage[]>([]);
+  const hasMoreOlderRef = useRef(true);
+  const loadingOlderRef = useRef(false);
+  const isGenerating = sending || regeneratingMessageId !== null;
+
+  // Shared data from layout (stays mounted across sub-route navigations)
+  const {
+    session,
+    sessionLoading,
+    characters,
+    personas,
+    settings,
+    backgroundImageData,
+    theme,
+    chatAppearance,
+    updateSession,
+    group,
+    updateGroup,
+    reloadSession,
+    setDraftAppearanceOverride,
+    appearanceFieldUpdater,
+    registerAppearanceFieldUpdater,
+  } = useGroupChatLayoutContext();
+  const helpMeReplyEnabled = settings?.advancedSettings?.helpMeReplyEnabled ?? true;
+
+  // Get current persona
+  const currentPersona = useMemo(() => {
+    if (!session?.personaId) return null;
+    return personas.find((p) => p.id === session.personaId) || null;
+  }, [session, personas]);
+
+  const mutedCharacterIds = useMemo(
+    () => new Set(session?.mutedCharacterIds ?? []),
+    [session?.mutedCharacterIds],
+  );
+
+  const handleToggleMute = useCallback(
+    async (characterId: string, muted: boolean) => {
+      if (!session) return;
+      const previous = session.mutedCharacterIds ?? [];
+      const next = new Set(previous);
+      const activeCount = session.characterIds.length - next.size;
+      if (muted && activeCount <= 1 && !next.has(characterId)) return;
+      if (muted) {
+        next.add(characterId);
+      } else {
+        next.delete(characterId);
+      }
+      const nextArr = Array.from(next);
+      updateSession({ ...session, mutedCharacterIds: nextArr });
+      try {
+        await storageBridge.groupSessionUpdateMutedCharacterIds(session.id, nextArr);
+      } catch (err) {
+        console.error("Failed to update muted characters:", err);
+        updateSession({ ...session, mutedCharacterIds: previous });
+      }
+    },
+    [session, updateSession],
+  );
+
+  const isMobilePlatform = useMemo(() => {
+    const p = getPlatform();
+    return p === "android" || p === "ios";
+  }, []);
+
+  const handleOpenAppearance = useCallback(() => {
+    if (!session) return;
+    if (isMobilePlatform) {
+      navigate(Routes.groupChatAppearance(session.id));
+    } else {
+      setAppearanceDrawerOpen(true);
+    }
+  }, [isMobilePlatform, navigate, session]);
+
+  const handleOpenSettings = useCallback(() => {
+    if (!session) return;
+    if (isMobilePlatform) {
+      navigate(Routes.groupChatSettings(session.id));
+    } else {
+      setSettingsDrawerOpen(true);
+    }
+  }, [isMobilePlatform, navigate, session]);
+
+  // Load messages and stats (session, characters, personas, settings come from layout)
+  const loadData = useCallback(async () => {
+    if (!groupSessionId) return;
+
+    try {
+      const [msgs, stats, msgCount] = await Promise.all([
+        storageBridge.groupMessagesList(groupSessionId, MESSAGES_PAGE_SIZE),
+        storageBridge.groupParticipationStats(groupSessionId),
+        storageBridge.groupMessageCount(groupSessionId),
+      ]);
+
+      setMessages(msgs);
+      messagesRef.current = msgs;
+      hasMoreOlderRef.current = msgs.length >= MESSAGES_PAGE_SIZE;
+      setParticipationStats(stats);
+      setTotalMessageCount(msgCount);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t("common.labels.loading"));
+    } finally {
+      setLoading(false);
+    }
+  }, [groupSessionId]);
+
+  useEffect(() => {
+    loadData();
+  }, [loadData]);
+
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
+
+  const refreshMessageCount = useCallback(async () => {
+    if (!groupSessionId) return;
+    try {
+      setTotalMessageCount(await storageBridge.groupMessageCount(groupSessionId));
+    } catch (err) {
+      console.warn("GroupChatPage: failed to load message count", err);
+    }
+  }, [groupSessionId]);
+
+  const loadOlderGroupMessages = useCallback(async () => {
+    if (!groupSessionId) return;
+    if (loadingOlderRef.current || !hasMoreOlderRef.current) return;
+    const first = messagesRef.current[0];
+    if (!first) return;
+    loadingOlderRef.current = true;
+    try {
+      const older: GroupMessage[] = await storageBridge.groupMessagesList(
+        groupSessionId,
+        MESSAGES_PAGE_SIZE,
+        first.createdAt,
+        first.id,
+      );
+      if (older.length === 0) {
+        hasMoreOlderRef.current = false;
+        return;
+      }
+      hasMoreOlderRef.current = older.length >= MESSAGES_PAGE_SIZE;
+      setMessages((prev) => {
+        const seen = new Set(prev.map((m) => m.id));
+        const merged = [...older.filter((m) => !seen.has(m.id)), ...prev];
+        messagesRef.current = merged;
+        return merged;
+      });
+    } catch (err) {
+      console.warn("GroupChatPage: failed to load older messages", err);
+    } finally {
+      loadingOlderRef.current = false;
+    }
+  }, [groupSessionId]);
+
+  const ensureGroupMessageLoaded = useCallback(
+    async (messageId: string) => {
+      for (let i = 0; i < 20; i += 1) {
+        if (messagesRef.current.some((m) => m.id === messageId)) return;
+        if (!hasMoreOlderRef.current) return;
+        await loadOlderGroupMessages();
+      }
+    },
+    [loadOlderGroupMessages],
+  );
+
+  const jumpToMessageId = searchParams.get("jumpToMessage");
+  useEffect(() => {
+    if (!jumpToMessageId || loading) return;
+
+    let cancelled = false;
+    let rafId: number | null = null;
+    let highlightTimeoutId: number | null = null;
+
+    const run = async () => {
+      await ensureGroupMessageLoaded(jumpToMessageId);
+      if (cancelled) return;
+
+      let tries = 0;
+      const tryScroll = () => {
+        if (cancelled) return;
+        const el = document.getElementById(`group-msg-${jumpToMessageId}`);
+        if (el) {
+          isAtBottomRef.current = false;
+          setIsAtBottom(false);
+          el.scrollIntoView({ behavior: "smooth", block: "center" });
+          el.classList.add("ring-2", "ring-accent", "rounded-xl");
+          highlightTimeoutId = window.setTimeout(() => {
+            el.classList.remove("ring-2", "ring-accent", "rounded-xl");
+          }, 2000);
+          const next = new URLSearchParams(searchParams);
+          next.delete("jumpToMessage");
+          setSearchParams(next, { replace: true });
+          return;
+        }
+        tries += 1;
+        if (tries < 30) {
+          rafId = window.requestAnimationFrame(tryScroll);
+        }
+      };
+      rafId = window.requestAnimationFrame(tryScroll);
+    };
+
+    void run();
+
+    return () => {
+      cancelled = true;
+      if (rafId !== null) window.cancelAnimationFrame(rafId);
+      if (highlightTimeoutId !== null) window.clearTimeout(highlightTimeoutId);
+    };
+  }, [jumpToMessageId, loading, ensureGroupMessageLoaded, searchParams, setSearchParams]);
+
+  useEffect(() => {
+    if (!error) return;
+
+    const timer = setTimeout(() => {
+      setError(null);
+    }, 10000);
+
+    return () => clearTimeout(timer);
+  }, [error]);
+
+  useEffect(() => {
+    platformRef.current = getPlatform();
+
+    const updateHapticsState = async () => {
+      try {
+        const nextSettings = await readSettings();
+        const accessibility = nextSettings.advancedSettings?.accessibility;
+        hapticsEnabledRef.current = accessibility?.haptics ?? false;
+        hapticIntensityRef.current = accessibility?.hapticIntensity ?? "light";
+      } catch {
+        // ignore settings read failures for haptics
+      }
+    };
+
+    void updateHapticsState();
+    window.addEventListener(SETTINGS_UPDATED_EVENT, updateHapticsState);
+    return () => window.removeEventListener(SETTINGS_UPDATED_EVENT, updateHapticsState);
+  }, []);
+
+  const triggerTypingHaptic = useCallback(async () => {
+    if (!hapticsEnabledRef.current) return;
+    const isMobile = platformRef.current === "android" || platformRef.current === "ios";
+    if (!isMobile) return;
+
+    const now = Date.now();
+    if (now - lastHapticTimeRef.current < 60) return;
+
+    lastHapticTimeRef.current = now;
+    try {
+      await impactFeedback(hapticIntensityRef.current);
+    } catch {
+      // ignore haptics plugin errors
+    }
+  }, []);
+
+  const lastMessageContentLength = messages[messages.length - 1]?.content.length ?? 0;
+
+  const updateIsAtBottom = useCallback(() => {
+    const container = scrollContainerRef.current;
+    if (!container) return null;
+
+    const { scrollTop, clientHeight, scrollHeight } = container;
+    const atBottom = scrollTop + clientHeight >= scrollHeight - STICKY_BOTTOM_THRESHOLD_PX;
+    isAtBottomRef.current = atBottom;
+    setIsAtBottom((prev) => (prev === atBottom ? prev : atBottom));
+    return scrollTop;
+  }, []);
+
+  useEffect(() => {
+    if (!groupSessionId) return;
+
+    const unlisten = listen<{
+      sessionId: string;
+      status: string;
+      characterId?: string;
+      characterName?: string;
+      message?: string;
+    }>("group_chat_status", (event) => {
+      const { sessionId, status, characterId, characterName } = event.payload;
+
+      if (sessionId !== groupSessionId) return;
+
+      if (status === "selecting_character") {
+        setSendingStatus("selecting");
+        setSelectedCharacterId(null);
+        setSelectedCharacterName(null);
+      } else if (status === "character_selected") {
+        setSendingStatus("generating");
+        setSelectedCharacterId(characterId || null);
+        setSelectedCharacterName(characterName || null);
+        // Look up character avatar
+        const char = characters.find((c) => c.id === characterId);
+        setSelectedCharacterAvatarUrl(char?.avatarPath || null);
+
+        // Update the placeholder message with the selected character
+        const placeholderId = assistantPlaceholderIdRef.current;
+        if (placeholderId && characterId) {
+          setMessages((prev) => {
+            return prev.map((m) =>
+              m.id === placeholderId ? { ...m, speakerCharacterId: characterId } : m,
+            );
+          });
+        }
+      } else if (status === "complete") {
+        setSendingStatus(null);
+        setSelectedCharacterId(null);
+        setSelectedCharacterName(null);
+        setSelectedCharacterAvatarUrl(null);
+      } else if (status === "error") {
+        setSendingStatus(null);
+        setSelectedCharacterId(null);
+        setSelectedCharacterName(null);
+        setSelectedCharacterAvatarUrl(null);
+        const message =
+          typeof event.payload.message === "string"
+            ? event.payload.message
+            : t("groupChats.page.requestFailed");
+        if (!isAbortMessage(message)) {
+          setError(message);
+        }
+      }
+    });
+
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, [groupSessionId, characters, t]);
+
+  const handleScroll = useCallback(() => {
+    updateIsAtBottom();
+  }, [updateIsAtBottom]);
+
+  const scrollToBottom = useCallback((behavior: ScrollBehavior = "smooth") => {
+    if (scrollContainerRef.current) {
+      isAtBottomRef.current = true;
+      setIsAtBottom(true);
+      scrollContainerRef.current.scrollTo({
+        top: scrollContainerRef.current.scrollHeight,
+        behavior,
+      });
+    }
+  }, []);
+
+  useEffect(() => {
+    const platform = getPlatform();
+    const isMobile = platform === "android" || platform === "ios";
+    if (!isMobile) {
+      setKeyboardInset(0);
+      return;
+    }
+
+    const visualViewport = window.visualViewport;
+    let focusTimer: number | null = null;
+
+    const updateKeyboardInset = () => {
+      const baseHeight = window.innerHeight;
+      const viewportHeight = visualViewport?.height ?? baseHeight;
+      const viewportOffsetTop = visualViewport?.offsetTop ?? 0;
+      const rawInset = Math.max(0, baseHeight - viewportHeight - viewportOffsetTop);
+      const nextInset = rawInset > MOBILE_KEYBOARD_THRESHOLD_PX ? Math.round(rawInset) : 0;
+
+      setKeyboardInset((prev) => (prev === nextInset ? prev : nextInset));
+
+      window.requestAnimationFrame(() => {
+        updateIsAtBottom();
+        const activeElement = document.activeElement;
+        if (activeElement instanceof HTMLTextAreaElement && isAtBottomRef.current) {
+          scrollToBottom("auto");
+        }
+      });
+    };
+
+    const handleFocusChange = () => {
+      updateKeyboardInset();
+      if (focusTimer !== null) {
+        window.clearTimeout(focusTimer);
+      }
+      focusTimer = window.setTimeout(updateKeyboardInset, 180);
+    };
+
+    updateKeyboardInset();
+    visualViewport?.addEventListener("resize", updateKeyboardInset);
+    visualViewport?.addEventListener("scroll", updateKeyboardInset);
+    window.addEventListener("resize", updateKeyboardInset);
+    document.addEventListener("focusin", handleFocusChange);
+    document.addEventListener("focusout", handleFocusChange);
+
+    return () => {
+      if (focusTimer !== null) {
+        window.clearTimeout(focusTimer);
+      }
+      visualViewport?.removeEventListener("resize", updateKeyboardInset);
+      visualViewport?.removeEventListener("scroll", updateKeyboardInset);
+      window.removeEventListener("resize", updateKeyboardInset);
+      document.removeEventListener("focusin", handleFocusChange);
+      document.removeEventListener("focusout", handleFocusChange);
+    };
+  }, [scrollToBottom, updateIsAtBottom]);
+
+  useLayoutEffect(() => {
+    const container = scrollContainerRef.current;
+    if (!container) {
+      return;
+    }
+
+    const frame = window.requestAnimationFrame(() => {
+      if (isAtBottomRef.current) {
+        container.scrollTop = container.scrollHeight;
+      }
+      updateIsAtBottom();
+    });
+
+    return () => window.cancelAnimationFrame(frame);
+  }, [lastMessageContentLength, messages.length, isGenerating, updateIsAtBottom]);
+
+  useEffect(() => {
+    if (!isAtBottom || !isGenerating) return;
+    scrollToBottom("auto");
+  }, [isAtBottom, isGenerating, scrollToBottom]);
+
+  const isDirectorMode =
+    session?.speakerSelectionMethod === "director" ||
+    session?.speakerSelectionMethod === "director_action";
+  const directorBehavior: "cue" | "action" =
+    session?.speakerSelectionMethod === "director_action" ? "action" : "cue";
+
+  const handleAddUserMessage = useCallback(
+    async (text: string): Promise<boolean> => {
+      if (!groupSessionId) return false;
+      const trimmed = text.trim();
+      if (!trimmed) return false;
+      const tempUserMessage: GroupMessage = {
+        id: `temp-user-${Date.now()}`,
+        sessionId: groupSessionId,
+        role: "user",
+        content: trimmed,
+        speakerCharacterId: null,
+        turnNumber: messages.length + 1,
+        createdAt: Date.now(),
+        usage: undefined,
+        variants: undefined,
+        selectedVariantId: undefined,
+        isPinned: false,
+        attachments: [],
+        reasoning: null,
+        selectionReasoning: null,
+      };
+      setMessages((prev) => [...prev, tempUserMessage]);
+      scrollToBottom();
+      try {
+        await storageBridge.groupChatAddUserMessage(groupSessionId, trimmed);
+        const updated = await storageBridge.groupMessagesList(groupSessionId, MESSAGES_PAGE_SIZE);
+        setMessages(updated);
+        await refreshMessageCount();
+        return true;
+      } catch (err) {
+        console.error("Failed to add user message:", err);
+        setError(err instanceof Error ? err.message : "Failed to add message");
+        setMessages((prev) => prev.filter((m) => m.id !== tempUserMessage.id));
+        return false;
+      }
+    },
+    [groupSessionId, messages.length, refreshMessageCount, scrollToBottom],
+  );
+
+  const handleSend = useCallback(async () => {
+    if (!groupSessionId || !draft.trim() || sending) return;
+
+    const userMessage = draft.trim();
+    const attachmentsToSend = pendingAttachments;
+    const requestId = crypto.randomUUID();
+    activeRequestIdRef.current = requestId;
+    setDraft("");
+    setPendingAttachments([]);
+    setSending(true);
+    setSendingStatus("selecting");
+    setError(null);
+
+    // Create stable IDs for placeholders
+    const userPlaceholderId = `temp-user-${Date.now()}`;
+    const assistantPlaceholderId = `temp-assistant-${Date.now()}`;
+
+    // Store the assistant placeholder ID in ref so the status listener can find it
+    assistantPlaceholderIdRef.current = assistantPlaceholderId;
+
+    // Optimistic update - add user message
+    const tempUserMessage: GroupMessage = {
+      id: userPlaceholderId,
+      sessionId: groupSessionId,
+      role: "user",
+      content: userMessage,
+      speakerCharacterId: null,
+      turnNumber: messages.length + 1,
+      createdAt: Date.now(),
+      usage: undefined,
+      variants: undefined,
+      selectedVariantId: undefined,
+      isPinned: false,
+      attachments: attachmentsToSend,
+      reasoning: null,
+      selectionReasoning: null,
+    };
+
+    // Create placeholder assistant message (will be updated with character when selected)
+    const tempAssistantMessage: GroupMessage = {
+      id: assistantPlaceholderId,
+      sessionId: groupSessionId,
+      role: "assistant",
+      content: "",
+      speakerCharacterId: null, // Will be set when character_selected event fires
+      turnNumber: messages.length + 2,
+      createdAt: Date.now(),
+      usage: undefined,
+      variants: undefined,
+      selectedVariantId: undefined,
+      isPinned: false,
+      attachments: [],
+      reasoning: null,
+      selectionReasoning: null,
+    };
+
+    // Add both user and assistant placeholder immediately
+    setMessages((prev) => [...prev, tempUserMessage, tempAssistantMessage]);
+    scrollToBottom();
+
+    let unlistenNormalized: (() => void) | null = null;
+
+    try {
+      // Listen for streaming updates
+      unlistenNormalized = await listen<any>(`api-normalized://${requestId}`, (event) => {
+        try {
+          const payload =
+            typeof event.payload === "string" ? JSON.parse(event.payload) : event.payload;
+
+          if (payload && payload.type === "delta" && payload.data?.text) {
+            // Update the placeholder message with streamed content
+            setMessages((prev) => {
+              return prev.map((m) =>
+                m.id === assistantPlaceholderId
+                  ? { ...m, content: m.content + String(payload.data.text) }
+                  : m,
+              );
+            });
+            void triggerTypingHaptic();
+          } else if (payload && payload.type === "reasoning" && payload.data?.text) {
+            // Update reasoning
+            setMessages((prev) => {
+              return prev.map((m) =>
+                m.id === assistantPlaceholderId
+                  ? { ...m, reasoning: (m.reasoning || "") + String(payload.data.text) }
+                  : m,
+              );
+            });
+            void triggerTypingHaptic();
+          } else if (payload && payload.type === "error" && payload.data?.message) {
+            const message = String(payload.data.message);
+            if (!isAbortMessage(message)) {
+              setError(message);
+            }
+          }
+        } catch {
+          // ignore malformed payloads
+        }
+      });
+
+      const response = await storageBridge.groupChatSend(
+        groupSessionId,
+        userMessage,
+        true,
+        requestId,
+        attachmentsToSend,
+      );
+
+      // Update messages with actual saved messages
+      const updatedMessages = await storageBridge.groupMessagesList(
+        groupSessionId,
+        MESSAGES_PAGE_SIZE,
+      );
+      setMessages(updatedMessages);
+      setParticipationStats(response.participationStats);
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      if (isAbortMessage(errMsg)) {
+        setError(null);
+        try {
+          const updatedMessages = await storageBridge.groupMessagesList(
+            groupSessionId,
+            MESSAGES_PAGE_SIZE,
+          );
+          setMessages(updatedMessages);
+        } catch (loadErr) {
+          console.error("Failed to refresh messages after abort:", loadErr);
+          setMessages((prev) => prev.filter((m) => m.id !== assistantPlaceholderId));
+        }
+        return;
+      }
+      console.error("Failed to send message:", err);
+      setError(errMsg || t("common.buttons.retry"));
+      try {
+        const updatedMessages = await storageBridge.groupMessagesList(
+          groupSessionId,
+          MESSAGES_PAGE_SIZE,
+        );
+        setMessages(updatedMessages);
+      } catch (loadErr) {
+        console.error("Failed to refresh messages after error:", loadErr);
+        setMessages((prev) =>
+          prev.filter((m) => m.id !== userPlaceholderId && m.id !== assistantPlaceholderId),
+        );
+      }
+    } finally {
+      if (unlistenNormalized) unlistenNormalized();
+      assistantPlaceholderIdRef.current = null;
+      if (activeRequestIdRef.current === requestId) {
+        activeRequestIdRef.current = null;
+      }
+      setSending(false);
+      setSendingStatus(null);
+      setSelectedCharacterId(null);
+      setSelectedCharacterName(null);
+      setSelectedCharacterAvatarUrl(null);
+      void refreshMessageCount();
+    }
+  }, [
+    groupSessionId,
+    draft,
+    sending,
+    pendingAttachments,
+    messages.length,
+    refreshMessageCount,
+    scrollToBottom,
+    triggerTypingHaptic,
+    t,
+  ]);
+
+  const handleRegenerate = useCallback(
+    async (messageId: string, forceCharacterId?: string, guidance?: string, modelId?: string) => {
+      if (!groupSessionId || regeneratingMessageId) return;
+
+      const requestId = crypto.randomUUID();
+      activeRequestIdRef.current = requestId;
+      setRegeneratingMessageId(messageId);
+      setError(null);
+
+      // Clear the message content to show streaming
+      setMessages((prev) =>
+        prev.map((m) => (m.id === messageId ? { ...m, content: "", reasoning: null } : m)),
+      );
+
+      let unlistenNormalized: (() => void) | null = null;
+
+      try {
+        // Listen for streaming updates
+        unlistenNormalized = await listen<any>(`api-normalized://${requestId}`, (event) => {
+          try {
+            const payload =
+              typeof event.payload === "string" ? JSON.parse(event.payload) : event.payload;
+
+            if (payload && payload.type === "delta" && payload.data?.text) {
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === messageId ? { ...m, content: m.content + String(payload.data.text) } : m,
+                ),
+              );
+              void triggerTypingHaptic();
+            } else if (payload && payload.type === "reasoning" && payload.data?.text) {
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === messageId
+                    ? { ...m, reasoning: (m.reasoning || "") + String(payload.data.text) }
+                    : m,
+                ),
+              );
+              void triggerTypingHaptic();
+            } else if (payload && payload.type === "error" && payload.data?.message) {
+              const message = String(payload.data.message);
+              if (!isAbortMessage(message)) {
+                setError(message);
+              }
+            }
+          } catch {
+            // ignore malformed payloads
+          }
+        });
+
+        const response = await storageBridge.groupChatRegenerate(
+          groupSessionId,
+          messageId,
+          forceCharacterId,
+          requestId,
+          guidance,
+          modelId,
+        );
+
+        // Update messages with final saved data
+        const updatedMessages = await storageBridge.groupMessagesList(
+          groupSessionId,
+          MESSAGES_PAGE_SIZE,
+        );
+        setMessages(updatedMessages);
+        setParticipationStats(response.participationStats);
+      } catch (err) {
+        console.error("Failed to regenerate:", err);
+        const errMsg = err instanceof Error ? err.message : String(err);
+        if (!isAbortMessage(errMsg)) {
+          setError(errMsg || t("common.buttons.retry"));
+        } else {
+          setError(null);
+        }
+        // Reload messages to restore original content on error
+        const updatedMessages = await storageBridge.groupMessagesList(
+          groupSessionId,
+          MESSAGES_PAGE_SIZE,
+        );
+        setMessages(updatedMessages);
+      } finally {
+        if (unlistenNormalized) unlistenNormalized();
+        setRegeneratingMessageId(null);
+        if (activeRequestIdRef.current === requestId) {
+          activeRequestIdRef.current = null;
+        }
+      }
+    },
+    [groupSessionId, regeneratingMessageId, triggerTypingHaptic],
+  );
+
+  const handleContinue = useCallback(
+    async (forceCharacterId?: string) => {
+      if (!groupSessionId || sending) return;
+
+      const requestId = crypto.randomUUID();
+      activeRequestIdRef.current = requestId;
+      const assistantPlaceholderId = `temp-continue-${Date.now()}`;
+
+      setSending(true);
+      setSendingStatus("selecting");
+      setError(null);
+
+      // Store placeholder ID for status listener
+      assistantPlaceholderIdRef.current = assistantPlaceholderId;
+
+      // Create placeholder assistant message
+      const tempAssistantMessage: GroupMessage = {
+        id: assistantPlaceholderId,
+        sessionId: groupSessionId,
+        role: "assistant",
+        content: "",
+        speakerCharacterId: null,
+        turnNumber: messages.length + 1,
+        createdAt: Date.now(),
+        usage: undefined,
+        variants: undefined,
+        selectedVariantId: undefined,
+        isPinned: false,
+        attachments: [],
+        reasoning: null,
+        selectionReasoning: null,
+      };
+
+      setMessages((prev) => [...prev, tempAssistantMessage]);
+      scrollToBottom();
+
+      let unlistenNormalized: (() => void) | null = null;
+
+      try {
+        // Listen for streaming updates
+        unlistenNormalized = await listen<any>(`api-normalized://${requestId}`, (event) => {
+          try {
+            const payload =
+              typeof event.payload === "string" ? JSON.parse(event.payload) : event.payload;
+
+            if (payload && payload.type === "delta" && payload.data?.text) {
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === assistantPlaceholderId
+                    ? { ...m, content: m.content + String(payload.data.text) }
+                    : m,
+                ),
+              );
+              void triggerTypingHaptic();
+            } else if (payload && payload.type === "reasoning" && payload.data?.text) {
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === assistantPlaceholderId
+                    ? { ...m, reasoning: (m.reasoning || "") + String(payload.data.text) }
+                    : m,
+                ),
+              );
+              void triggerTypingHaptic();
+            } else if (payload && payload.type === "error" && payload.data?.message) {
+              const message = String(payload.data.message);
+              if (!isAbortMessage(message)) {
+                setError(message);
+              }
+            }
+          } catch {
+            // ignore malformed payloads
+          }
+        });
+
+        const response = await storageBridge.groupChatContinue(
+          groupSessionId,
+          forceCharacterId,
+          requestId,
+        );
+
+        // Update messages with final saved data
+        const updatedMessages = await storageBridge.groupMessagesList(
+          groupSessionId,
+          MESSAGES_PAGE_SIZE,
+        );
+        setMessages(updatedMessages);
+        setParticipationStats(response.participationStats);
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        if (isAbortMessage(errMsg)) {
+          setError(null);
+          try {
+            const updatedMessages = await storageBridge.groupMessagesList(
+              groupSessionId,
+              MESSAGES_PAGE_SIZE,
+            );
+            setMessages(updatedMessages);
+          } catch (loadErr) {
+            console.error("Failed to refresh messages after abort:", loadErr);
+            setMessages((prev) => prev.filter((m) => m.id !== assistantPlaceholderId));
+          }
+          return;
+        }
+        console.error("Failed to continue:", err);
+        setError(errMsg || t("common.buttons.retry"));
+        // Remove placeholder on error
+        setMessages((prev) => prev.filter((m) => m.id !== assistantPlaceholderId));
+      } finally {
+        if (unlistenNormalized) unlistenNormalized();
+        assistantPlaceholderIdRef.current = null;
+        if (activeRequestIdRef.current === requestId) {
+          activeRequestIdRef.current = null;
+        }
+        setSending(false);
+        setSendingStatus(null);
+        setSelectedCharacterId(null);
+        setSelectedCharacterName(null);
+        setSelectedCharacterAvatarUrl(null);
+        void refreshMessageCount();
+      }
+    },
+    [
+      groupSessionId,
+      sending,
+      messages.length,
+      refreshMessageCount,
+      scrollToBottom,
+      triggerTypingHaptic,
+    ],
+  );
+
+  const handleAbort = useCallback(async () => {
+    const requestId = activeRequestIdRef.current;
+    if (!requestId) return;
+
+    try {
+      await storageBridge.abortRequest(requestId);
+    } catch (err) {
+      console.error("Failed to abort group chat request:", err);
+    }
+  }, []);
+
+  const handleDirectorAction = useCallback(
+    async (characterId: string) => {
+      if (sending) return;
+      if (!session?.characterIds.includes(characterId)) return;
+      const text = draft.trim();
+      if (text) {
+        setDraft("");
+        const added = await handleAddUserMessage(text);
+        if (!added) {
+          setDraft(text);
+          return;
+        }
+      }
+      setDirectorSelectedId(characterId);
+      try {
+        await handleContinue(characterId);
+      } finally {
+        setDirectorSelectedId(null);
+      }
+    },
+    [sending, session, draft, setDraft, handleAddUserMessage, handleContinue],
+  );
+
+  const handleDirectorTap = useCallback(
+    (characterId: string) => {
+      if (sending) return;
+      if (directorBehavior === "action") {
+        void handleDirectorAction(characterId);
+        return;
+      }
+      setDirectorSelectedId(characterId);
+    },
+    [sending, directorBehavior, handleDirectorAction],
+  );
+
+  const handleDirectorAddMessage = useCallback(async () => {
+    if (sending) return;
+    const text = draft.trim();
+    if (!text) return;
+    setDraft("");
+    const added = await handleAddUserMessage(text);
+    if (!added) setDraft(text);
+  }, [sending, draft, setDraft, handleAddUserMessage]);
+
+  const handleDirectorSend = useCallback(async () => {
+    if (sending) return;
+    const text = draft.trim();
+    const selected =
+      directorSelectedId && session?.characterIds.includes(directorSelectedId)
+        ? directorSelectedId
+        : null;
+    if (!selected) {
+      setDirectorWiggleNonce((n) => n + 1);
+      return;
+    }
+    if (text) {
+      setDraft("");
+      const added = await handleAddUserMessage(text);
+      if (!added) return;
+    }
+    await handleContinue(selected);
+  }, [sending, draft, directorSelectedId, session, handleAddUserMessage, handleContinue]);
+
+  useEffect(() => {
+    setDirectorSelectedId(null);
+  }, [isDirectorMode, directorBehavior]);
+
+  const getCharacterById = useCallback(
+    (characterId?: string | null): Character | undefined => {
+      if (!characterId) return undefined;
+      return characters.find((c) => c.id === characterId);
+    },
+    [characters],
+  );
+
+  // Variant state management for drag-to-change-variants
+  const getVariantState = useCallback((message: GroupMessage): VariantState => {
+    const variants = message.variants ?? [];
+    if (variants.length === 0) {
+      return {
+        variants: [],
+        selectedIndex: -1,
+        total: 0,
+      };
+    }
+    const explicitIndex = message.selectedVariantId
+      ? variants.findIndex((variant) => variant.id === message.selectedVariantId)
+      : -1;
+    const selectedIndex = explicitIndex >= 0 ? explicitIndex : variants.length - 1;
+    return {
+      variants,
+      selectedIndex,
+      total: variants.length,
+    };
+  }, []);
+
+  const handleVariantSwipe = useCallback(
+    async (messageId: string, direction: "prev" | "next") => {
+      const message = messages.find((m) => m.id === messageId);
+      if (!message) return;
+
+      const variantState = getVariantState(message);
+      if (variantState.total <= 1) return;
+
+      const currentIndex = variantState.selectedIndex;
+      let nextIndex: number;
+
+      if (direction === "prev") {
+        nextIndex = currentIndex > 0 ? currentIndex - 1 : variantState.total - 1;
+      } else {
+        nextIndex = currentIndex < variantState.total - 1 ? currentIndex + 1 : 0;
+      }
+
+      const variants = variantState.variants ?? [];
+      const nextVariant = variants[nextIndex];
+      if (!nextVariant) return;
+
+      try {
+        await storageBridge.groupMessageSelectVariant(messageId, nextVariant.id);
+        // Refresh messages to get updated content
+        const updatedMessages = await storageBridge.groupMessagesList(
+          groupSessionId!,
+          MESSAGES_PAGE_SIZE,
+        );
+        setMessages(updatedMessages);
+      } catch (err) {
+        console.error("Failed to select variant:", err);
+      }
+    },
+    [messages, getVariantState, groupSessionId],
+  );
+
+  const handleVariantDrag = useCallback(
+    (messageId: string, offsetX: number) => {
+      if (offsetX > 60) {
+        void handleVariantSwipe(messageId, "prev");
+      } else if (offsetX < -60) {
+        void handleVariantSwipe(messageId, "next");
+      }
+    },
+    [handleVariantSwipe],
+  );
+
+  // Message action handlers
+  const openMessageActions = useCallback((message: GroupMessage) => {
+    setMessageAction({ message, mode: "view" });
+    setHeldMessageId(message.id);
+    setActionError(null);
+    setActionStatus(null);
+  }, []);
+
+  const closeMessageActions = useCallback(() => {
+    setMessageAction(null);
+    setHeldMessageId(null);
+    setEditDraft("");
+    setActionError(null);
+    setActionStatus(null);
+  }, []);
+
+  const handleCopyMessage = useCallback(async () => {
+    if (!messageAction) return;
+    try {
+      await navigator.clipboard?.writeText(messageAction.message.content);
+      setActionStatus("Copied!");
+      setTimeout(() => setActionStatus(null), 1500);
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : "Failed to copy");
+    }
+  }, [messageAction]);
+
+  const handleDeleteMessage = useCallback(async () => {
+    if (!messageAction || !groupSessionId) return;
+
+    if (messageAction.message.isPinned) {
+      setActionError("Cannot delete pinned message. Unpin it first.");
+      return;
+    }
+
+    setActionBusy(true);
+    try {
+      await storageBridge.groupMessageDelete(groupSessionId, messageAction.message.id);
+      const updatedMessages = await storageBridge.groupMessagesList(
+        groupSessionId,
+        MESSAGES_PAGE_SIZE,
+      );
+      setMessages(updatedMessages);
+      await refreshMessageCount();
+      closeMessageActions();
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : "Failed to delete");
+    } finally {
+      setActionBusy(false);
+    }
+  }, [messageAction, groupSessionId, closeMessageActions, refreshMessageCount]);
+
+  const handleRewindToMessage = useCallback(async () => {
+    if (!messageAction || !groupSessionId) return;
+
+    const messageIndex = messages.findIndex((message) => message.id === messageAction.message.id);
+    if (messageIndex === -1) {
+      setActionError("Message not found");
+      return;
+    }
+
+    const hasPinnedAfter = messages.slice(messageIndex + 1).some((message) => message.isPinned);
+    if (hasPinnedAfter) {
+      setActionError(
+        "Cannot rewind: there are pinned messages after this point. Unpin them first.",
+      );
+      return;
+    }
+
+    setActionBusy(true);
+    try {
+      await storageBridge.groupMessagesDeleteAfter(groupSessionId, messageAction.message.id);
+      const updatedMessages = await storageBridge.groupMessagesList(
+        groupSessionId,
+        MESSAGES_PAGE_SIZE,
+      );
+      setMessages(updatedMessages);
+      await refreshMessageCount();
+      const stats = await storageBridge.groupParticipationStats(groupSessionId);
+      setParticipationStats(stats);
+      const refreshedSession = await storageBridge.groupSessionGet(groupSessionId);
+      if (refreshedSession) {
+        updateSession(refreshedSession);
+      }
+      closeMessageActions();
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : "Failed to rewind");
+    } finally {
+      setActionBusy(false);
+    }
+  }, [
+    messageAction,
+    groupSessionId,
+    closeMessageActions,
+    messages,
+    refreshMessageCount,
+    updateSession,
+  ]);
+
+  const handleTogglePin = useCallback(async () => {
+    if (!messageAction || !groupSessionId) return;
+
+    setActionBusy(true);
+    setActionError(null);
+    setActionStatus(null);
+    try {
+      const nextPinned = await toggleGroupMessagePin(groupSessionId, messageAction.message.id);
+      if (nextPinned === null) {
+        setActionError("Failed to toggle pin");
+        return;
+      }
+
+      const updatedMessages = messages.map((message) =>
+        message.id === messageAction.message.id ? { ...message, isPinned: nextPinned } : message,
+      );
+      setMessages(updatedMessages);
+      setMessageAction({
+        ...messageAction,
+        message: { ...messageAction.message, isPinned: nextPinned },
+      });
+      setActionStatus(nextPinned ? "Message pinned" : "Message unpinned");
+      setTimeout(() => {
+        closeMessageActions();
+      }, 1000);
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : "Failed to toggle pin");
+    } finally {
+      setActionBusy(false);
+    }
+  }, [closeMessageActions, groupSessionId, messageAction, messages]);
+
+  const handleBranchToCharacter = useCallback(
+    async (characterId: string) => {
+      if (!messageAction || !session) return;
+
+      setActionBusy(true);
+      setActionError(null);
+      setActionStatus(null);
+      try {
+        const allMessages = await listAllGroupMessages(session.id);
+        const branched = await createBranchedSessionFromGroupMessage(
+          session,
+          allMessages,
+          messageAction.message.id,
+          characterId,
+        );
+        closeMessageActions();
+        navigate(Routes.chatSession(branched.characterId, branched.id));
+      } catch (err) {
+        setActionError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setActionBusy(false);
+      }
+    },
+    [messageAction, session, closeMessageActions, navigate],
+  );
+
+  const handleSaveEdit = useCallback(async () => {
+    if (!messageAction || !groupSessionId || !editDraft.trim()) return;
+
+    setActionBusy(true);
+    try {
+      const updatedMessage = {
+        ...messageAction.message,
+        content: editDraft.trim(),
+      };
+      await storageBridge.groupMessageUpsert(groupSessionId, updatedMessage);
+      const updatedMessages = await storageBridge.groupMessagesList(
+        groupSessionId,
+        MESSAGES_PAGE_SIZE,
+      );
+      setMessages(updatedMessages);
+      closeMessageActions();
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : "Failed to save");
+    } finally {
+      setActionBusy(false);
+    }
+  }, [messageAction, groupSessionId, editDraft, closeMessageActions]);
+
+  // Check if all group characters support image input
+  useEffect(() => {
+    const checkImageSupport = async () => {
+      if (!session || !settings || !characters.length) {
+        setSupportsImageInput(false);
+        return;
+      }
+
+      try {
+        const groupChars = session.characterIds
+          .map((id) => characters.find((c) => c.id === id))
+          .filter(Boolean) as Character[];
+
+        if (groupChars.length === 0) {
+          setSupportsImageInput(false);
+          return;
+        }
+
+        // Check if ALL characters support image input
+        const allSupport = groupChars.every((char) => {
+          const effectiveModelId = char.defaultModelId || settings.defaultModelId;
+          const model = settings.models.find((m: Model) => m.id === effectiveModelId);
+          return model?.inputScopes?.includes("image") ?? false;
+        });
+
+        setSupportsImageInput(allSupport);
+      } catch (err) {
+        console.error("Failed to check image support:", err);
+        setSupportsImageInput(false);
+      }
+    };
+
+    checkImageSupport();
+  }, [session, settings, characters]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadInstalled = () =>
+      asrWhisperListInstalledModels()
+        .then((list) => {
+          if (!cancelled) setInstalledWhisperModels(list);
+        })
+        .catch((err) => {
+          console.error("Failed to load installed Whisper models:", err);
+        });
+    loadInstalled();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (footerAsrMode !== "recording") return;
+    const timer = window.setInterval(() => {
+      const startedAt = footerRecorderRef.current?.startedAt;
+      if (startedAt) setFooterRecordingMs(Date.now() - startedAt);
+    }, 200);
+    footerRecordingTimerRef.current = timer;
+    return () => {
+      window.clearInterval(timer);
+      footerRecordingTimerRef.current = null;
+    };
+  }, [footerAsrMode]);
+
+  useEffect(() => {
+    return () => {
+      const session = footerRecorderRef.current;
+      if (session) {
+        try {
+          session.processor.disconnect();
+          session.source.disconnect();
+          session.stream.getTracks().forEach((track) => track.stop());
+          void session.audioContext.close();
+        } catch {}
+        footerRecorderRef.current = null;
+      }
+      if (footerRecordingTimerRef.current != null) {
+        window.clearInterval(footerRecordingTimerRef.current);
+        footerRecordingTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (
+      !footerAsrRawText.trim() ||
+      !draft.trim() ||
+      draft.trim() === footerAsrBaseText.trim()
+    ) {
+      setFooterAsrSuggestions([]);
+      return;
+    }
+    const timeoutId = window.setTimeout(() => {
+      void asrSuggestCorrectionsFromEdit({
+        before: footerAsrRawText,
+        after: draft,
+        language: null,
+        scope: "conversation",
+      })
+        .then((next) => {
+          setFooterAsrSuggestions((prev) => {
+            const seen = new Set<string>();
+            const merged: AsrLearnedSuggestion[] = [];
+            const key = (s: AsrLearnedSuggestion) =>
+              `${s.normalizedWrong} ${s.normalizedCorrect}`;
+            for (const s of prev) {
+              if (next.some((n) => key(n) === key(s))) {
+                seen.add(key(s));
+                merged.push(s);
+              }
+            }
+            for (const s of next) {
+              if (!seen.has(key(s))) {
+                seen.add(key(s));
+                merged.push(s);
+              }
+            }
+            return merged;
+          });
+        })
+        .catch((error) => {
+          console.error("Failed to suggest ASR corrections from group footer edit:", error);
+        });
+    }, 250);
+    return () => window.clearTimeout(timeoutId);
+  }, [draft, footerAsrRawText, footerAsrBaseText]);
+
+  const stopFooterRecordingVisuals = useCallback(() => {
+    if (footerRecordingTimerRef.current != null) {
+      window.clearInterval(footerRecordingTimerRef.current);
+      footerRecordingTimerRef.current = null;
+    }
+    setFooterRecordingMs(0);
+    setFooterAnalyser(null);
+  }, []);
+
+  const stopFooterRecording = useCallback(async () => {
+    const session = footerRecorderRef.current;
+    if (!session) return;
+    footerRecorderRef.current = null;
+    setFooterAsrMode("transcribing");
+    setFooterAsrBusy(true);
+    try {
+      session.processor.disconnect();
+      session.source.disconnect();
+      session.stream.getTracks().forEach((track) => track.stop());
+      await session.audioContext.close();
+    } catch {}
+
+    try {
+      const total = session.chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+      if (total === 0) {
+        stopFooterRecordingVisuals();
+        setFooterAsrMode("idle");
+        setFooterAsrBusy(false);
+        setError(t("groupChats.pageExtra.noAudioCaptured"));
+        return;
+      }
+      const merged = new Float32Array(total);
+      let offset = 0;
+      for (const chunk of session.chunks) {
+        merged.set(chunk, offset);
+        offset += chunk.length;
+      }
+      const modelPath = installedWhisperModels[0]?.path;
+      if (!modelPath) {
+        stopFooterRecordingVisuals();
+        setFooterAsrMode("idle");
+        setFooterAsrBusy(false);
+        setError(t("groupChats.pageExtra.noWhisperModelInstalled"));
+        return;
+      }
+      const pcmBytes = new Uint8Array(merged.buffer, merged.byteOffset, merged.byteLength);
+      const result = await asrWhisperTranscribePcm({
+        modelPath,
+        pcmBytes,
+        sampleRateHz: session.sampleRate,
+        channels: 1,
+        scopes: ["conversation", "global"],
+        useGpu: true,
+        forceCpu: false,
+        keepModelLoaded: true,
+      });
+      const nextDraft = result.correctedText?.trim() || result.rawText?.trim();
+      setFooterAsrRawText(result.rawText || "");
+      setFooterAsrBaseText(nextDraft || "");
+      setDraft(nextDraft || "");
+      setFooterAsrSuggestions([]);
+      setFooterAsrMode("idle");
+    } catch (error) {
+      console.error("Failed to transcribe group footer recording:", error);
+      setFooterAsrMode("idle");
+      setError(error instanceof Error ? error.message : String(error));
+    } finally {
+      stopFooterRecordingVisuals();
+      setFooterAsrBusy(false);
+    }
+  }, [installedWhisperModels, setDraft, setError, stopFooterRecordingVisuals]);
+
+  const handleFooterMicClick = useCallback(async () => {
+    if (sending || footerAsrBusy) return;
+    if (footerAsrMode === "recording") {
+      await stopFooterRecording();
+      return;
+    }
+    setError(null);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: micConstraintsWithStoredDevice({
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        }),
+      });
+      const audioContext = new AudioContext();
+      const source = audioContext.createMediaStreamSource(stream);
+      const processor = audioContext.createScriptProcessor(4096, 1, 1);
+      const analyser = audioContext.createAnalyser();
+      analyser.fftSize = 1024;
+      analyser.smoothingTimeConstant = 0.4;
+      const chunks: Float32Array[] = [];
+      processor.onaudioprocess = (event) => {
+        chunks.push(new Float32Array(event.inputBuffer.getChannelData(0)));
+      };
+      source.connect(analyser);
+      source.connect(processor);
+      processor.connect(audioContext.destination);
+      footerRecorderRef.current = {
+        stream,
+        audioContext,
+        source,
+        processor,
+        analyser,
+        chunks,
+        sampleRate: audioContext.sampleRate,
+        startedAt: Date.now(),
+      };
+      setFooterAnalyser(analyser);
+      setFooterAsrRawText("");
+      setFooterAsrBaseText("");
+      setFooterAsrSuggestions([]);
+      setFooterAsrMode("recording");
+      setFooterRecordingMs(0);
+    } catch (error) {
+      console.error("Failed to start group footer recording:", error);
+      setError(error instanceof Error ? error.message : String(error));
+    }
+  }, [footerAsrBusy, footerAsrMode, sending, setError, stopFooterRecording]);
+
+  const cancelFooterRecording = useCallback(() => {
+    const session = footerRecorderRef.current;
+    if (!session) return;
+    footerRecorderRef.current = null;
+    stopFooterRecordingVisuals();
+    try {
+      session.processor.disconnect();
+      session.source.disconnect();
+      session.stream.getTracks().forEach((track) => track.stop());
+      void session.audioContext.close();
+    } catch (err) {
+      console.warn("Failed to cleanly cancel group footer recording:", err);
+    }
+    setFooterAsrMode("idle");
+    setFooterAsrRawText("");
+    setFooterAsrBaseText("");
+    setFooterAsrSuggestions([]);
+  }, [stopFooterRecordingVisuals]);
+
+  const handleLearnFooterSuggestion = useCallback(
+    async (suggestion: AsrLearnedSuggestion) => {
+      if (footerAsrLearning) return;
+      setFooterAsrLearning(true);
+      try {
+        await asrCorrectionUpsert({
+          wrong: suggestion.wrong,
+          correct: suggestion.correct,
+          confidence: suggestion.confidence,
+          language: suggestion.language ?? null,
+          scope: suggestion.scope,
+          userApproved: true,
+        });
+        setFooterAsrSuggestions((prev) =>
+          prev.filter(
+            (item) =>
+              !(
+                item.normalizedWrong === suggestion.normalizedWrong &&
+                item.normalizedCorrect === suggestion.normalizedCorrect
+              ),
+          ),
+        );
+      } catch (error) {
+        console.error("Failed to learn group footer ASR correction:", error);
+        setError(error instanceof Error ? error.message : String(error));
+      } finally {
+        setFooterAsrLearning(false);
+      }
+    },
+    [footerAsrLearning, setError],
+  );
+
+  const handleIgnoreFooterSuggestion = useCallback(
+    async (suggestion: AsrLearnedSuggestion) => {
+      if (footerAsrLearning) return;
+      setFooterAsrLearning(true);
+      try {
+        await asrIgnoreSuggestion(suggestion);
+        setFooterAsrSuggestions((prev) =>
+          prev.filter(
+            (item) =>
+              !(
+                item.normalizedWrong === suggestion.normalizedWrong &&
+                item.normalizedCorrect === suggestion.normalizedCorrect
+              ),
+          ),
+        );
+      } catch (error) {
+        console.error("Failed to ignore group footer ASR suggestion:", error);
+        setError(error instanceof Error ? error.message : String(error));
+      } finally {
+        setFooterAsrLearning(false);
+      }
+    },
+    [footerAsrLearning, setError],
+  );
+
+  const asrInlinePanel =
+    footerAsrSuggestions.length === 0 ? undefined : (
+      <div className="space-y-1.5 px-4 py-2">
+        {footerAsrSuggestions.map((suggestion, idx) => (
+          <div
+            key={`${suggestion.normalizedWrong}-${suggestion.normalizedCorrect}-${idx}`}
+            className="flex flex-wrap items-center justify-between gap-2"
+          >
+            <div className="min-w-0 text-xs text-fg/65">
+              Learn correction:{" "}
+              <span className="text-danger/80 line-through decoration-danger/40">
+                {suggestion.wrong}
+              </span>
+              <span className="mx-1.5 text-fg/40">→</span>
+              <span className="font-medium text-fg">{suggestion.correct}</span>
+            </div>
+            <div className="flex shrink-0 gap-2">
+              <button
+                type="button"
+                onClick={() => void handleLearnFooterSuggestion(suggestion)}
+                disabled={footerAsrLearning}
+                className={cn(
+                  "rounded-full border border-accent/30 bg-accent/15 px-3 py-1 text-xs font-medium text-accent",
+                  "hover:border-accent/50 hover:bg-accent/20 disabled:opacity-50",
+                )}
+              >
+                {footerAsrLearning ? "Learning..." : "Learn"}
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleIgnoreFooterSuggestion(suggestion)}
+                disabled={footerAsrLearning}
+                className={cn(
+                  "rounded-full border border-fg/15 bg-fg/8 px-3 py-1 text-xs font-medium text-fg/70",
+                  "hover:border-fg/25 hover:bg-fg/12 disabled:opacity-50",
+                )}
+              >
+                Ignore
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+    );
+
+  const authorNoteInlineBar =
+    inlineAuthorNoteEnabled && session ? (
+      <GroupInlineAuthorNoteBar session={session} onSaved={(s) => updateSession(s)} />
+    ) : null;
+
+  const footerInlinePanel =
+    authorNoteInlineBar || asrInlinePanel ? (
+      <>
+        {authorNoteInlineBar}
+        {asrInlinePanel && (
+          <div className={authorNoteInlineBar ? "border-t border-fg/10" : undefined}>
+            {asrInlinePanel}
+          </div>
+        )}
+      </>
+    ) : undefined;
+
+  const handleOpenPlusMenu = useCallback(() => {
+    setShowPlusMenu(true);
+  }, []);
+
+  const clearHelpMeReplyRuntime = useCallback(() => {
+    if (helpMeReplyLoadingTimeoutRef.current !== null) {
+      window.clearTimeout(helpMeReplyLoadingTimeoutRef.current);
+      helpMeReplyLoadingTimeoutRef.current = null;
+    }
+    if (helpMeReplyUnlistenRef.current) {
+      helpMeReplyUnlistenRef.current();
+      helpMeReplyUnlistenRef.current = null;
+    }
+    helpMeReplyRequestIdRef.current = null;
+  }, []);
+
+  const cancelHelpMeReplyGeneration = useCallback(async () => {
+    const requestId = helpMeReplyRequestIdRef.current;
+    clearHelpMeReplyRuntime();
+    setGeneratingReply(false);
+    setHelpMeReplyReasoning(false);
+    if (!requestId) return;
+    try {
+      await storageBridge.abortRequest(requestId);
+    } catch (err) {
+      console.error("Failed to abort Help Me Reply request:", err);
+    }
+  }, [clearHelpMeReplyRuntime]);
+
+  const handleCloseHelpMeReplyResultMenu = useCallback(() => {
+    setShowResultMenu(false);
+    setGeneratedReply(null);
+    setHelpMeReplyError(null);
+    setHelpMeReplyReasoning(false);
+    void cancelHelpMeReplyGeneration();
+  }, [cancelHelpMeReplyGeneration]);
+
+  const handleHelpMeReply = useCallback(
+    async (mode: "new" | "enrich") => {
+      if (!session?.id) return;
+
+      // Close other menus and show result menu with loading state immediately
+      setShowChoiceMenu(false);
+      setShowPlusMenu(false);
+      setGeneratedReply(null);
+      setHelpMeReplyError(null);
+      setHelpMeReplyReasoning(false);
+      setGeneratingReply(true);
+      setShowResultMenu(true);
+
+      const requestId = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
+      helpMeReplyRequestIdRef.current = requestId;
+      let streamingText = "";
+      let hasStartedStreaming = false;
+
+      // Some reasoning models can spend several seconds thinking before sending reply text.
+      helpMeReplyLoadingTimeoutRef.current = window.setTimeout(() => {
+        if (!hasStartedStreaming) {
+          setHelpMeReplyReasoning(true);
+        }
+      }, 5000);
+
+      try {
+        // Set up streaming listener
+        const unlistenNormalized = await listen<any>(`api-normalized://${requestId}`, (event) => {
+          if (helpMeReplyRequestIdRef.current !== requestId) return;
+          try {
+            const payload =
+              typeof event.payload === "string" ? JSON.parse(event.payload) : event.payload;
+
+            if (payload && payload.type === "delta" && payload.data?.text) {
+              // Clear loading state on first streaming chunk
+              if (!hasStartedStreaming) {
+                hasStartedStreaming = true;
+                setGeneratingReply(false);
+                setHelpMeReplyReasoning(false);
+                if (helpMeReplyLoadingTimeoutRef.current !== null) {
+                  window.clearTimeout(helpMeReplyLoadingTimeoutRef.current);
+                  helpMeReplyLoadingTimeoutRef.current = null;
+                }
+              }
+              streamingText += String(payload.data.text);
+              setGeneratedReply(streamingText);
+            } else if (payload && payload.type === "reasoning" && payload.data?.text) {
+              if (!hasStartedStreaming) {
+                hasStartedStreaming = true;
+                if (helpMeReplyLoadingTimeoutRef.current !== null) {
+                  window.clearTimeout(helpMeReplyLoadingTimeoutRef.current);
+                  helpMeReplyLoadingTimeoutRef.current = null;
+                }
+              }
+              setGeneratingReply(true);
+              setHelpMeReplyReasoning(true);
+            } else if (payload && payload.type === "error") {
+              const message =
+                payload.data?.message ||
+                payload.data?.error ||
+                payload.message ||
+                "Help Me Reply failed.";
+              setHelpMeReplyError(String(message));
+              setGeneratingReply(false);
+              setHelpMeReplyReasoning(false);
+              if (helpMeReplyLoadingTimeoutRef.current !== null) {
+                window.clearTimeout(helpMeReplyLoadingTimeoutRef.current);
+                helpMeReplyLoadingTimeoutRef.current = null;
+              }
+            }
+          } catch (err) {
+            console.error("Error processing streaming event:", err);
+          }
+        });
+        helpMeReplyUnlistenRef.current = unlistenNormalized;
+
+        const currentDraft = mode === "enrich" && draft.trim() ? draft : undefined;
+        const result = await generateGroupChatUserReply(session.id, currentDraft, requestId);
+
+        // If we didn't get streaming updates, use the final result
+        if (!streamingText.trim()) {
+          if (result?.trim()) {
+            setGeneratedReply(result);
+          } else {
+            setHelpMeReplyError("Help Me Reply failed to generate a reply.");
+          }
+        }
+
+        setGeneratingReply(false);
+        setHelpMeReplyReasoning(false);
+        if (helpMeReplyLoadingTimeoutRef.current !== null) {
+          window.clearTimeout(helpMeReplyLoadingTimeoutRef.current);
+          helpMeReplyLoadingTimeoutRef.current = null;
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        setHelpMeReplyError(message);
+        setGeneratingReply(false);
+        setHelpMeReplyReasoning(false);
+      } finally {
+        // Only clear loading if streaming hasn't started yet
+        if (!hasStartedStreaming) {
+          setGeneratingReply(false);
+          setHelpMeReplyReasoning(false);
+        }
+        if (helpMeReplyRequestIdRef.current === requestId) {
+          clearHelpMeReplyRuntime();
+        }
+      }
+    },
+    [session?.id, draft, clearHelpMeReplyRuntime],
+  );
+
+  const handleUseReply = useCallback(() => {
+    if (generatedReply) {
+      setDraft(generatedReply);
+    }
+    setShowResultMenu(false);
+    setGeneratedReply(null);
+    setHelpMeReplyError(null);
+    setHelpMeReplyReasoning(false);
+  }, [generatedReply]);
+
+  const handlePlusMenuImageUpload = useCallback(() => {
+    setShowPlusMenu(false);
+    setShouldTriggerFileInput(true);
+  }, []);
+
+  const handlePlusMenuHelpMeReply = useCallback(() => {
+    setShowPlusMenu(false);
+    if (draft.trim()) {
+      // Has draft - show choice menu
+      setShowChoiceMenu(true);
+    } else {
+      // No draft - generate directly
+      void handleHelpMeReply("new");
+    }
+  }, [draft, handleHelpMeReply]);
+
+  useEffect(
+    () => () => {
+      void cancelHelpMeReplyGeneration();
+    },
+    [cancelHelpMeReplyGeneration],
+  );
+
+  const addPendingAttachment = useCallback((attachment: ImageAttachment) => {
+    setPendingAttachments((prev) => [...prev, attachment]);
+  }, []);
+
+  const removePendingAttachment = useCallback((attachmentId: string) => {
+    setPendingAttachments((prev) => prev.filter((a) => a.id !== attachmentId));
+  }, []);
+
+  const groupCharacters = useMemo(() => {
+    if (!session) return [];
+    return session.characterIds
+      .map((id) => characters.find((c) => c.id === id))
+      .filter(Boolean) as Character[];
+  }, [session, characters]);
+
+  // --- Widget area (desktop, non-full chat column) ---
+  const viewportWidth = useViewportWidth();
+  const widgetLayout = getChatWidgetLayout(chatAppearance, viewportWidth);
+  const widgetsOn = widgetLayout.enabled;
+  const [widgetEditNonce, setWidgetEditNonce] = useState(0);
+  const requestWidgetEdit = widgetsOn ? () => setWidgetEditNonce((n) => n + 1) : undefined;
+  const widgetLeftNodes = widgetLayout.showLeft
+    ? widgetLayout.showRight
+      ? chatAppearance.chatWidgetSlots.left
+      : [...chatAppearance.chatWidgetSlots.left, ...chatAppearance.chatWidgetSlots.right]
+    : [];
+  const widgetRightNodes = widgetLayout.showRight
+    ? widgetLayout.showLeft
+      ? chatAppearance.chatWidgetSlots.right
+      : [...chatAppearance.chatWidgetSlots.right, ...chatAppearance.chatWidgetSlots.left]
+    : [];
+
+  const persistWidgetSlots = useCallback(
+    async (slots: WidgetSlots) => {
+      if (!group) return;
+      const existing = (group.chatAppearance ?? {}) as Record<string, unknown>;
+      const saved = await updateGroupChatAppearance(group.id, {
+        ...existing,
+        chatWidgetSlots: slots,
+      });
+      updateGroup(saved);
+    },
+    [group, updateGroup],
+  );
+
+  const persistColumnWidthPx = useCallback(
+    async (px: number) => {
+      if (!group) return;
+      const existing = (group.chatAppearance ?? {}) as Record<string, unknown>;
+      const saved = await updateGroupChatAppearance(group.id, {
+        ...existing,
+        chatColumnWidth: "custom",
+        chatColumnWidthPx: px,
+      });
+      updateGroup(saved);
+    },
+    [group, updateGroup],
+  );
+
+  const widgetCharacter = groupCharacters[0] ?? null;
+  const widgetCtxValue = useMemo<WidgetActionContext>(() => {
+    const persistSlotMutation = async (
+      mutate: (nodes: WidgetNode[]) => WidgetNode[],
+    ) => {
+      if (!group) return;
+      const existing = (group.chatAppearance ?? {}) as Record<string, unknown>;
+      const slots = (existing.chatWidgetSlots as WidgetSlots | undefined) ?? {
+        left: [],
+        right: [],
+      };
+      const saved = await updateGroupChatAppearance(group.id, {
+        ...existing,
+        chatWidgetSlots: { left: mutate(slots.left), right: mutate(slots.right) },
+      });
+      updateGroup(saved);
+    };
+    const lastAssistant = [...messages]
+      .reverse()
+      .find((m) => m.role === "assistant" && !m.id.startsWith("placeholder"));
+    const contextCharacter = widgetCharacter
+      ? { ...widgetCharacter, memoryType: session?.memoryType ?? widgetCharacter.memoryType }
+      : null;
+    return {
+      character: contextCharacter,
+      characters: groupCharacters,
+      isGroup: true,
+      persona: currentPersona,
+      session: (session as unknown as Session) ?? null,
+      hasBackground: !!backgroundImageData,
+      messageCount: totalMessageCount,
+      sceneName: null,
+      memories: session?.memories ?? [],
+      personas,
+      models: settings?.models ?? [],
+      currentModelId: widgetCharacter?.defaultModelId ?? null,
+      swapPlacesActive: false,
+      voiceAutoplayActive: false,
+      canRegenerate: !!lastAssistant && !sending,
+      canContinue: messages.length > 0 && !sending,
+      isGenerating: sending,
+      onSelectPersona: async (personaId) => {
+        if (!session) return;
+        const updated = await storageBridge.groupSessionUpdatePersona(
+          session.id,
+          personaId ?? null,
+        );
+        updateSession(updated);
+      },
+      onSelectModel: async (modelId) => {
+        if (!widgetCharacter) return;
+        await saveCharacter({ id: widgetCharacter.id, defaultModelId: modelId ?? null });
+        reloadSession();
+      },
+      onAuthorNoteSaved: () => {},
+      onRegenerate: async () => {
+        if (lastAssistant) await handleRegenerate(lastAssistant.id);
+      },
+      onToggleSwapPlaces: () => {},
+      onNewSession: () => {},
+      onContinue: async () => {
+        await handleContinue();
+      },
+      onAbort: async () => {
+        await handleAbort();
+      },
+      onViewHistory: () => navigate(Routes.groupChatHistory(session?.groupCharacterId)),
+      onOpenMemories: () => session && navigate(Routes.groupChatMemories(session.id)),
+      onOpenSearch: () => session && navigate(Routes.groupChatSearch(session.id)),
+      onToggleVoiceAutoplay: () => {},
+      onUpdateScratchPad: async (nodeId, content) => {
+        await persistSlotMutation((nodes) => setScratchPadContentOnNode(nodes, nodeId, content));
+      },
+      onUpdateAuthorNote: async (content) => {
+        if (!session) return;
+        const trimmed = content.trim();
+        const updated = await updateGroupSessionAuthorNote(session.id, trimmed || null);
+        updateSession(updated);
+      },
+      onUpdateNode: async (nodeId, patch) => {
+        await persistSlotMutation((nodes) =>
+          patchWidgetNode(nodes, nodeId, patch as Partial<WidgetNode>),
+        );
+      },
+      onUpdateCompanionTimeOverride: () => {},
+      onInsertText: (text) => {
+        const trimmed = draft.trimEnd();
+        setDraft(trimmed ? `${trimmed} ${text}` : text);
+      },
+    };
+  }, [
+    widgetCharacter,
+    groupCharacters,
+    currentPersona,
+    backgroundImageData,
+    messages,
+    totalMessageCount,
+    session,
+    personas,
+    settings,
+    sending,
+    group,
+    updateGroup,
+    updateSession,
+    reloadSession,
+    handleRegenerate,
+    handleContinue,
+    handleAbort,
+    navigate,
+    draft,
+    setDraft,
+  ]);
+
+  if (sessionLoading || loading) {
+    return (
+      <div className="flex h-full items-center justify-center">
+        <Loader2 className="h-8 w-8 animate-spin text-fg/50" />
+      </div>
+    );
+  }
+
+  if (!session) {
+    return (
+      <div className="flex h-full flex-col items-center justify-center p-4">
+        <p className="text-fg/50 mb-4">{error || t("groupChats.page.sessionNotFound")}</p>
+        <button
+          onClick={() => navigate(Routes.groupChats)}
+          className={cn(
+            "px-4 py-2",
+            radius.md,
+            "border border-fg/15 bg-fg/10 text-fg",
+            interactive.transition.fast,
+          )}
+        >
+          {t("groupChats.page.backToGroupChats")}
+        </button>
+      </div>
+    );
+  }
+
+  const footerBottomOffset = `calc(env(safe-area-inset-bottom) + ${keyboardInset}px)`;
+  const scrollButtonBottomOffset = `calc(env(safe-area-inset-bottom) + ${keyboardInset}px + 88px)`;
+
+  const columnLayout = getChatColumnLayout(chatAppearance);
+  const participantsBarVisible =
+    groupCharacters.length >= 2 && (chatAppearance.participantsBarEnabled || isDirectorMode);
+  const messagesPadBottom = participantsBarVisible
+    ? isDirectorMode
+      ? "pb-28"
+      : "pb-20"
+    : "pb-6";
+  const headerInside = widgetsOn && chatAppearance.chatHeaderMoves;
+  const footerInside = widgetsOn && chatAppearance.chatFooterMoves;
+  const applyHeaderColumnClass = !widgetsOn && chatAppearance.chatHeaderMoves;
+  const applyFooterColumnClass = !widgetsOn && chatAppearance.chatFooterMoves;
+
+  const headerNode = (
+    <div
+      className={`relative z-20 shrink-0 ${applyHeaderColumnClass ? columnLayout.className : ""}`}
+      style={applyHeaderColumnClass ? columnLayout.style : undefined}
+    >
+      <GroupChatHeader
+        session={session}
+        characters={groupCharacters}
+        onBack={() => navigate(Routes.groupChats)}
+        onSettings={handleOpenSettings}
+        onMemories={() => navigate(Routes.groupChatMemories(session.id))}
+        onLorebooks={() => navigate(Routes.groupChatLorebook(session.id))}
+        onAppearance={group ? handleOpenAppearance : undefined}
+        onSearch={() => navigate(Routes.groupChatSearch(session.id))}
+        onEditWidgets={!isMobilePlatform ? requestWidgetEdit : undefined}
+        hasBackgroundImage={!!backgroundImageData}
+        headerOverlayClassName={theme.headerOverlay}
+        transparentHeader={chatAppearance.transparentHeader}
+      />
+    </div>
+  );
+
+  const footerNode = (
+    <div
+      className={`relative z-20 shrink-0 ${applyFooterColumnClass ? columnLayout.className : ""}`}
+      style={{
+        paddingBottom: footerBottomOffset,
+        ...(applyFooterColumnClass ? columnLayout.style : {}),
+      }}
+    >
+      <GroupChatFooter
+        draft={draft}
+        setDraft={setDraft}
+        error={error}
+        setError={setError}
+        sending={sending}
+        characters={groupCharacters}
+        persona={currentPersona}
+        onSendMessage={
+          isDirectorMode
+            ? directorBehavior === "action"
+              ? handleDirectorAddMessage
+              : handleDirectorSend
+            : handleSend
+        }
+        onContinue={
+          isDirectorMode ? undefined : messages.length > 0 ? () => handleContinue() : undefined
+        }
+        onAbort={handleAbort}
+        directorMode={isDirectorMode}
+        directorBehavior={directorBehavior}
+        directorSelectedId={directorSelectedId}
+        directorWiggleNonce={directorWiggleNonce}
+        directorHintPosition={chatAppearance.participantsBarHintPosition}
+        onSelectSpeaker={handleDirectorTap}
+        hasBackgroundImage={!!backgroundImageData}
+        footerOverlayClassName={theme.footerOverlay}
+        footerOverlayColor={theme.footerOverlayColor}
+        footerFgColor={theme.footerFgColor}
+        footerFgMutedColor={theme.footerFgMutedColor}
+        pendingAttachments={pendingAttachments}
+        onAddAttachment={supportsImageInput ? addPendingAttachment : undefined}
+        onRemoveAttachment={supportsImageInput ? removePendingAttachment : undefined}
+        onOpenPlusMenu={handleOpenPlusMenu}
+        triggerFileInput={shouldTriggerFileInput}
+        onFileInputTriggered={() => setShouldTriggerFileInput(false)}
+        inlinePanel={footerInlinePanel}
+        onMicClick={
+          installedWhisperModels.length === 0
+            ? undefined
+            : () => {
+                void handleFooterMicClick();
+              }
+        }
+        onMicCancel={cancelFooterRecording}
+        micActive={footerAsrMode === "recording" || footerAsrMode === "transcribing"}
+        micDisabled={footerAsrBusy}
+        recordingElapsedMs={footerRecordingMs}
+        recordingAnalyser={footerAnalyser}
+        recordingTranscribing={footerAsrMode === "transcribing"}
+        composerDisabled={footerAsrMode !== "idle"}
+        mutedCharacterIds={mutedCharacterIds}
+        onToggleMute={handleToggleMute}
+        participantsBarEnabled={chatAppearance.participantsBarEnabled}
+        participantsBarSize={chatAppearance.participantsBarAvatarSize}
+        participantsBarShape={chatAppearance.participantsBarAvatarShape}
+        participantsBarBackground={chatAppearance.participantsBarBackground}
+        participantsBarGap={chatAppearance.participantsBarGap}
+        participantsBarAlign={chatAppearance.participantsBarAlign}
+      />
+    </div>
+  );
+
+  return (
+    <div
+      className={cn(
+        "relative flex h-full flex-col overflow-hidden",
+        !backgroundImageData && "bg-surface",
+      )}
+    >
+      {beetrootRain.overlay}
+      {/* Content layer - on top of background */}
+      <div
+        className="relative z-10 flex h-full flex-col"
+      >
+        {!headerInside && headerNode}
+
+        {/* Main content area - flex-1 takes remaining space */}
+        <WidgetContextProvider value={widgetCtxValue}>
+          <WidgetEditProvider
+            slots={chatAppearance.chatWidgetSlots}
+            onPersist={persistWidgetSlots}
+            editRequestNonce={widgetEditNonce}
+          >
+            <ChatWidgetArea
+              widgetLayout={widgetLayout}
+              leftNodes={widgetLeftNodes}
+              rightNodes={widgetRightNodes}
+              resizable={chatAppearance.chatColumnWidth === "custom" && appearanceDrawerOpen}
+              viewportWidth={viewportWidth}
+              onResizeColumn={(px) => {
+                if (appearanceFieldUpdater) {
+                  appearanceFieldUpdater("chatColumnWidthPx", px);
+                } else {
+                  void persistColumnWidthPx(px);
+                }
+              }}
+            >
+        {headerInside && headerNode}
+        <main
+          ref={scrollContainerRef}
+          onScroll={handleScroll}
+          className="relative w-full flex-1 overflow-y-auto px-2 pb-2"
+        >
+          <div
+            className={`${getChatColumnLayout(chatAppearance).className} ${chatAppearance.messageGap === "tight" ? "space-y-2" : chatAppearance.messageGap === "relaxed" ? "space-y-6" : "space-y-4"} ${messagesPadBottom} pt-4`}
+            style={{
+              ...getChatColumnLayout(chatAppearance).style,
+              backgroundColor: backgroundImageData
+                ? theme.contentOverlay || "transparent"
+                : "transparent",
+            }}
+          >
+            {messages.length === 0 ? (
+              <div className="flex min-h-[50vh] items-center justify-center">
+                <p className="text-fg/30 text-center">
+                  {t("groupChats.page.startConversation", {
+                    names: groupCharacters.map((c) => c.name).join(", "),
+                  })}
+                </p>
+              </div>
+            ) : (
+              <AnimatePresence initial={false}>
+                {messages.map((message, index) => {
+                  const parsed = splitThinkTags(message.content);
+                  const combinedReasoning = [message.reasoning ?? "", parsed.reasoning]
+                    .filter(Boolean)
+                    .join("\n");
+                  return (
+                    <GroupChatMessage
+                      key={message.id}
+                      message={message}
+                      index={index}
+                      messagesLength={messages.length}
+                      heldMessageId={heldMessageId}
+                      regeneratingMessageId={regeneratingMessageId}
+                      sending={sending}
+                      character={getCharacterById(message.speakerCharacterId)}
+                      persona={currentPersona}
+                      characters={groupCharacters}
+                      theme={theme}
+                      chatAppearance={chatAppearance}
+                      getVariantState={getVariantState}
+                      handleVariantDrag={handleVariantDrag}
+                      handleRegenerate={async (msg, options) => {
+                        await handleRegenerate(msg.id, undefined, options?.guidance, options?.modelId);
+                      }}
+                      models={settings?.models ?? []}
+                      onLongPress={(msg) => openMessageActions(msg)}
+                      displayContent={parsed.content}
+                      reasoning={combinedReasoning || undefined}
+                    />
+                  );
+                })}
+              </AnimatePresence>
+            )}
+
+            {/* Sending Indicator - only show during selection phase */}
+            {sending && sendingStatus === "selecting" && (
+              <motion.div
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                className="flex items-center gap-2 mt-4 text-fg/50"
+              >
+                <Loader2 className="h-4 w-4 animate-spin" />
+                <span className="text-sm">{t("groupChats.page.selectingCharacter")}</span>
+              </motion.div>
+            )}
+          </div>
+        </main>
+        {footerInside && footerNode}
+            </ChatWidgetArea>
+          </WidgetEditProvider>
+        </WidgetContextProvider>
+
+        {/* Scroll to Bottom Button */}
+        <AnimatePresence>
+          {!isAtBottom && (
+            <motion.button
+              type="button"
+              aria-label={t("groupChats.pageExtra.scrollToBottomAria")}
+              onClick={() => scrollToBottom("smooth")}
+              initial={{ opacity: 0, y: 10, scale: 0.98 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 10, scale: 0.98 }}
+              transition={{ duration: 0.18, ease: "easeOut" }}
+              className={cn(
+                "fixed right-3 z-30 flex h-11 w-11 items-center justify-center",
+                "border border-fg/15 bg-surface-el/40 text-fg/80 shadow-lg backdrop-blur-sm",
+                "hover:bg-surface-el/55 active:scale-95",
+                radius.full,
+              )}
+              style={{ bottom: scrollButtonBottomOffset }}
+            >
+              <ChevronDown size={18} />
+            </motion.button>
+          )}
+        </AnimatePresence>
+
+        {!footerInside && footerNode}
+      </div>
+
+      <DynamicMemoryApprovalGate sessionId={groupSessionId ?? null} variant="group" />
+
+      {/* Plus Menu - Upload Image & Help Me Reply */}
+      <BottomMenu isOpen={showPlusMenu} onClose={() => setShowPlusMenu(false)} title={t("groupChats.addContentMenu.title")}>
+        <div className="space-y-2">
+          {supportsImageInput && (
+            <MenuButton icon={Image} title={t("groupChats.addContentMenu.uploadImage")} onClick={handlePlusMenuImageUpload} />
+          )}
+          {helpMeReplyEnabled && (
+            <MenuButton
+              icon={Sparkles}
+              title={t("groupChats.helpMeReplyMenu.title")}
+              description={t("groupChats.helpMeReplyMenu.helpMeReplyDesc")}
+              onClick={handlePlusMenuHelpMeReply}
+            />
+          )}
+        </div>
+      </BottomMenu>
+
+      {/* Choice Menu - Use existing draft or generate new */}
+      <BottomMenu
+        isOpen={showChoiceMenu}
+        onClose={() => setShowChoiceMenu(false)}
+        title={t("groupChats.helpMeReplyMenu.title")}
+      >
+        <div className="space-y-2">
+          <p className="text-sm text-fg/60 mb-4">
+            {t("groupChats.helpMeReplyMenu.draftPrompt")}
+          </p>
+          <MenuButton
+            icon={PenLine}
+            title={t("groupChats.helpMeReplyMenu.useTextAsBase")}
+            description={t("groupChats.helpMeReplyMenu.useTextAsBaseDesc")}
+            onClick={() => handleHelpMeReply("enrich")}
+          />
+          <MenuButton
+            icon={Sparkles}
+            title={t("groupChats.helpMeReplyMenu.writeSomethingNew")}
+            description={t("groupChats.helpMeReplyMenu.writeSomethingNewDesc")}
+            onClick={() => handleHelpMeReply("new")}
+          />
+        </div>
+      </BottomMenu>
+
+      {/* Result Menu - Show generated reply with Regenerate/Use options */}
+      <BottomMenu
+        isOpen={showResultMenu}
+        onClose={handleCloseHelpMeReplyResultMenu}
+        title={t("groupChats.suggestedReplyMenu.title")}
+      >
+        <div className="space-y-4">
+          {helpMeReplyError ? (
+            <div className="bg-danger/10 border border-danger/30 rounded-lg p-4">
+              <p className="text-danger text-sm">{helpMeReplyError}</p>
+            </div>
+          ) : generatingReply && !generatedReply ? (
+            <div className="flex flex-col items-center justify-center gap-3 py-8" role="status">
+              <Loader2 className="h-8 w-8 animate-spin text-fg/50" />
+              <p className="text-center text-sm text-fg/60">
+                {helpMeReplyReasoning
+                  ? t("groupChats.suggestedReplyMenu.reasoningBeforeWriting")
+                  : t("groupChats.suggestedReplyMenu.writingYourReply")}
+              </p>
+            </div>
+          ) : generatedReply ? (
+            <div
+              className={cn(
+                "bg-fg/5 border border-fg/10 p-4",
+                radius.lg,
+                "max-h-[40vh] overflow-y-auto",
+              )}
+            >
+              <p className="text-fg/90 text-sm whitespace-pre-wrap">{generatedReply}</p>
+            </div>
+          ) : null}
+
+          <div className="flex gap-3">
+            <button
+              onClick={() => handleHelpMeReply(draft.trim() ? "enrich" : "new")}
+              disabled={generatingReply}
+              className={cn(
+                "flex-1 flex items-center justify-center gap-2 py-3 px-4",
+                radius.lg,
+                "bg-fg/10 text-fg/80 hover:bg-fg/15",
+                "disabled:opacity-50 transition-all",
+              )}
+            >
+              <RefreshCw size={18} />
+              <span>{t("groupChats.suggestedReplyMenu.regenerate")}</span>
+            </button>
+            <button
+              onClick={handleUseReply}
+              disabled={generatingReply || !generatedReply}
+              className={cn(
+                "flex-1 flex items-center justify-center gap-2 py-3 px-4",
+                radius.lg,
+                "bg-accent text-fg hover:bg-accent/80",
+                "disabled:opacity-50 transition-all",
+              )}
+            >
+              <Check size={18} />
+              <span>{t("groupChats.suggestedReplyMenu.useReply")}</span>
+            </button>
+          </div>
+        </div>
+      </BottomMenu>
+
+      {/* Message Actions Bottom Sheet */}
+      <GroupChatMessageActionsBottomSheet
+        messageAction={messageAction}
+        actionError={actionError}
+        actionStatus={actionStatus}
+        actionBusy={actionBusy}
+        editDraft={editDraft}
+        setEditDraft={setEditDraft}
+        closeMessageActions={closeMessageActions}
+        setActionError={setActionError}
+        setActionStatus={setActionStatus}
+        handleSaveEdit={handleSaveEdit}
+        handleDeleteMessage={handleDeleteMessage}
+        handleRewindToMessage={handleRewindToMessage}
+        handleTogglePin={handleTogglePin}
+        handleCopyMessage={handleCopyMessage}
+        setMessageAction={setMessageAction}
+        onRegenerate={(charId) => {
+          closeMessageActions();
+          if (messageAction) {
+            handleRegenerate(messageAction.message.id, charId);
+          }
+        }}
+        onBranchToCharacter={(charId) => void handleBranchToCharacter(charId)}
+        onOpenChatAppearance={handleOpenAppearance}
+        characters={groupCharacters}
+      />
+
+      {!isMobilePlatform && group && (
+        <GroupChatAppearanceDrawer
+          open={appearanceDrawerOpen}
+          onClose={() => setAppearanceDrawerOpen(false)}
+          group={group}
+          onGroupUpdate={updateGroup}
+          setDraftOverride={setDraftAppearanceOverride}
+          registerFieldUpdater={registerAppearanceFieldUpdater}
+        />
+      )}
+
+      {!isMobilePlatform && (
+        <GroupChatSettingsDrawer
+          isOpen={settingsDrawerOpen}
+          onClose={() => setSettingsDrawerOpen(false)}
+          groupSessionId={session.id}
+        />
+      )}
+
+      {showGroupTour && !loading && session && (
+        <GuidedTour tour="groupChatDetail" onDismiss={dismissGroupTour} />
+      )}
+    </div>
+  );
+}
